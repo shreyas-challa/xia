@@ -1,5 +1,6 @@
 mod ast;
 mod lexer;
+mod parser;
 
 fn main() {
     let path = std::env::args().nth(1).unwrap_or_else(|| {
@@ -10,12 +11,8 @@ fn main() {
         eprintln!("error: cannot read {path}: {e}");
         std::process::exit(1);
     });
-    match lexer::lex(&source) {
-        Ok(tokens) => {
-            for tok in &tokens {
-                println!("{:?}", tok.kind);
-            }
-        }
+    match parser::parse(&source) {
+        Ok(program) => println!("{program:#?}"),
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(1);
