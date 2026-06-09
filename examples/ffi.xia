@@ -1,0 +1,8 @@
+# Zero-cost C FFI: declare any libc symbol and call it directly.
+
+extern fn printf(fmt: str, ...) -> int
+extern fn llabs(n: int) -> int
+
+fn main() -> int:
+    printf("%s scored %lld points\n", "xia", llabs(0 - 42))
+    return 0

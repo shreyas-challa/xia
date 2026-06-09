@@ -1,0 +1,17 @@
+# Strings are heap-allocated and managed by ARC — no garbage collector.
+
+fn greet(name: str) -> str:
+    return "hello, " + name + "!"
+
+fn main() -> int:
+    let g = greet("world")
+    print(g)
+
+    # Aliasing retains; reassignment releases the old value.
+    let copy = g
+    copy = copy + " (again)"
+    print(copy)
+
+    if g == "hello, world!":
+        print("strings compare by value")
+    return 0

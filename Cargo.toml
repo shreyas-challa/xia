@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 logos = "0.15"
 inkwell = { version = "0.6", features = ["llvm18-1"] }
+clap = { version = "4", features = ["derive"] }
