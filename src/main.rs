@@ -1,5 +1,6 @@
 mod arc;
 mod ast;
+mod codegen;
 mod lexer;
 mod parser;
 mod sema;
