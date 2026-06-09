@@ -1,3 +1,4 @@
+mod arc;
 mod ast;
 mod lexer;
 mod parser;
@@ -23,5 +24,6 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(1);
     }
+    arc::ArcInserter::new().run(&mut program);
     println!("{program:#?}");
 }
