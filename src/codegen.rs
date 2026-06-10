@@ -28,12 +28,27 @@ use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, Poi
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
 use std::collections::HashMap;
 
-/// String memory layout: a heap block is `[i64 refcount][bytes...][NUL]` and
-/// the `str` value points at the bytes, so it doubles as a `char*` for the C
-/// FFI. A negative refcount marks an immortal value (string literals live in
+/// Heap memory layout. Every reference-counted block carries a 16-byte
+/// header `[i64 kind][i64 refcount]` and the value points just past it:
+///
+/// - string (kind 0): `[kind][rc][bytes...][NUL]` — the value points at the
+///   bytes, so every Xia `str` doubles as a `char*` for the C FFI.
+/// - array (kind 1 plain / kind 2 heap elements):
+///   `[kind][rc][i64 len][i64 cap][ptr data]` — the value points at `len`;
+///   elements live in a separately allocated buffer of 8-byte words.
+///
+/// A negative refcount marks an immortal value (string literals live in
 /// constant globals and are never freed). `xia_retain`/`xia_release` are
-/// null-safe and skip immortals.
+/// null-safe and skip immortals. Releasing a kind-2 array to zero releases
+/// each element before freeing the buffer and the block.
 const RC_OFFSET: i64 = 8;
+const HEADER_SIZE: i64 = 16;
+const KIND_STR: u64 = 0;
+const KIND_ARR: u64 = 1;
+const KIND_ARR_HEAP: u64 = 2;
+/// Array field offsets relative to the value pointer.
+const ARR_CAP_OFFSET: u64 = 8;
+const ARR_DATA_OFFSET: u64 = 16;
 
 pub struct CodeGen<'ctx> {
     context: &'ctx Context,
@@ -814,26 +829,32 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// Interned immortal string literal: a private constant global laid out
-    /// as `{ i64 -1, [n+1 x i8] }` whose value pointer targets the bytes.
+    /// as `{ i64 kind, i64 -1, [n+1 x i8] }` whose value pointer targets the
+    /// bytes.
     fn str_literal(&mut self, s: &str) -> CResult<PointerValue<'ctx>> {
         if let Some(p) = self.str_literals.get(s) {
             return Ok(*p);
         }
         let i64_ty = self.context.i64_type();
         let data = self.context.const_string(s.as_bytes(), true);
-        let init = self
-            .context
-            .const_struct(&[i64_ty.const_int(u64::MAX, true).into(), data.into()], false);
+        let init = self.context.const_struct(
+            &[
+                i64_ty.const_int(KIND_STR, false).into(),
+                i64_ty.const_int(u64::MAX, true).into(),
+                data.into(),
+            ],
+            false,
+        );
         let global = self.module.add_global(init.get_type(), None, "str.lit");
         global.set_initializer(&init);
         global.set_constant(true);
         global.set_linkage(inkwell::module::Linkage::Private);
         let zero = self.context.i32_type().const_zero();
-        let one = self.context.i32_type().const_int(1, false);
+        let two = self.context.i32_type().const_int(2, false);
         let ptr = unsafe {
             global
                 .as_pointer_value()
-                .const_gep(init.get_type(), &[zero, one])
+                .const_gep(init.get_type(), &[zero, two])
         };
         self.str_literals.insert(s.to_string(), ptr);
         Ok(ptr)
@@ -866,6 +887,37 @@ impl<'ctx> CodeGen<'ctx> {
         let off = self.context.i64_type().const_int((-RC_OFFSET) as u64, true);
         unsafe {
             b.build_gep(self.context.i8_type(), val, &[off], "rc.ptr")
+                .map_err(err)
+        }
+    }
+
+    /// Pointer to the start of the block (the kind word), `val - 16`.
+    fn block_ptr(
+        &self,
+        b: &Builder<'ctx>,
+        val: PointerValue<'ctx>,
+    ) -> CResult<PointerValue<'ctx>> {
+        let off = self
+            .context
+            .i64_type()
+            .const_int((-HEADER_SIZE) as u64, true);
+        unsafe {
+            b.build_gep(self.context.i8_type(), val, &[off], "block.ptr")
+                .map_err(err)
+        }
+    }
+
+    /// Pointer to a field of an array value at byte offset `off`.
+    fn arr_field(
+        &self,
+        b: &Builder<'ctx>,
+        val: PointerValue<'ctx>,
+        off: u64,
+        name: &str,
+    ) -> CResult<PointerValue<'ctx>> {
+        let off = self.context.i64_type().const_int(off, false);
+        unsafe {
+            b.build_gep(self.context.i8_type(), val, &[off], name)
                 .map_err(err)
         }
     }
@@ -914,6 +966,7 @@ impl<'ctx> CodeGen<'ctx> {
         let void = self.context.void_type();
         let ty = void.fn_type(&[self.ptr_ty().into()], false);
         let i64_ty = self.context.i64_type();
+        let ptr_ty = self.ptr_ty();
         let ctx = self.context;
         let free_ty = void.fn_type(&[self.ptr_ty().into()], false);
         let (free_ptr, free_fnty) = self.libc("free", free_ty);
@@ -922,7 +975,12 @@ impl<'ctx> CodeGen<'ctx> {
             let entry = ctx.append_basic_block(f, "entry");
             let check = ctx.append_basic_block(f, "check");
             let dec = ctx.append_basic_block(f, "dec");
-            let dead = ctx.append_basic_block(f, "free");
+            let dead = ctx.append_basic_block(f, "dead");
+            let arr = ctx.append_basic_block(f, "arr");
+            let elem_loop = ctx.append_basic_block(f, "elem.loop");
+            let elem_body = ctx.append_basic_block(f, "elem.body");
+            let free_data = ctx.append_basic_block(f, "free.data");
+            let free_block = ctx.append_basic_block(f, "free.block");
             let store = ctx.append_basic_block(f, "store");
             let done = ctx.append_basic_block(f, "done");
 
@@ -947,9 +1005,69 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(err)?;
             b.build_conditional_branch(is_zero, dead, store).map_err(err)?;
 
+            // Dead value: arrays free their element buffer (releasing each
+            // element first if they are heap values); then the block goes.
             b.position_at_end(dead);
-            // The malloc'd block starts at the refcount header.
-            b.build_indirect_call(free_fnty, free_ptr, &[rc_ptr.into()], "")
+            let block = self.block_ptr(b, p)?;
+            let kind = b.build_load(i64_ty, block, "kind").map_err(err)?.into_int_value();
+            let is_arr = b
+                .build_int_compare(
+                    IntPredicate::NE,
+                    kind,
+                    i64_ty.const_int(KIND_STR, false),
+                    "is_arr",
+                )
+                .map_err(err)?;
+            b.build_conditional_branch(is_arr, arr, free_block).map_err(err)?;
+
+            b.position_at_end(arr);
+            let len = b.build_load(i64_ty, p, "len").map_err(err)?.into_int_value();
+            let data_slot = self.arr_field(b, p, ARR_DATA_OFFSET, "data.slot")?;
+            let data = b
+                .build_load(ptr_ty, data_slot, "data")
+                .map_err(err)?
+                .into_pointer_value();
+            let heap_elems = b
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    kind,
+                    i64_ty.const_int(KIND_ARR_HEAP, false),
+                    "heap_elems",
+                )
+                .map_err(err)?;
+            b.build_conditional_branch(heap_elems, elem_loop, free_data)
+                .map_err(err)?;
+
+            b.position_at_end(elem_loop);
+            let i = b.build_phi(i64_ty, "i").map_err(err)?;
+            let iv = i.as_basic_value().into_int_value();
+            let more = b
+                .build_int_compare(IntPredicate::SLT, iv, len, "more")
+                .map_err(err)?;
+            b.build_conditional_branch(more, elem_body, free_data)
+                .map_err(err)?;
+
+            b.position_at_end(elem_body);
+            let slot = unsafe {
+                b.build_gep(i64_ty, data, &[iv], "elem.slot").map_err(err)?
+            };
+            let word = b.build_load(i64_ty, slot, "elem").map_err(err)?.into_int_value();
+            let elem_ptr = b.build_int_to_ptr(word, ptr_ty, "elem.ptr").map_err(err)?;
+            // Recursive: nested heap values release through the same path.
+            b.build_call(f, &[elem_ptr.into()], "").map_err(err)?;
+            let next = b
+                .build_int_add(iv, i64_ty.const_int(1, false), "i.next")
+                .map_err(err)?;
+            i.add_incoming(&[(&i64_ty.const_zero(), arr), (&next, elem_body)]);
+            b.build_unconditional_branch(elem_loop).map_err(err)?;
+
+            b.position_at_end(free_data);
+            b.build_indirect_call(free_fnty, free_ptr, &[data.into()], "")
+                .map_err(err)?;
+            b.build_unconditional_branch(free_block).map_err(err)?;
+
+            b.position_at_end(free_block);
+            b.build_indirect_call(free_fnty, free_ptr, &[block.into()], "")
                 .map_err(err)?;
             b.build_unconditional_branch(done).map_err(err)?;
 
@@ -975,7 +1093,7 @@ impl<'ctx> CodeGen<'ctx> {
             let len = f.get_nth_param(0).unwrap().into_int_value();
             let entry = ctx.append_basic_block(f, "entry");
             b.position_at_end(entry);
-            let header = i64_ty.const_int((RC_OFFSET + 1) as u64, false);
+            let header = i64_ty.const_int((HEADER_SIZE + 1) as u64, false);
             let size = b.build_int_add(len, header, "size").map_err(err)?;
             let block = b
                 .build_indirect_call(malloc_fnty, malloc_ptr, &[size.into()], "block")
@@ -984,12 +1102,22 @@ impl<'ctx> CodeGen<'ctx> {
                 .left()
                 .unwrap()
                 .into_pointer_value();
-            b.build_store(block, i64_ty.const_int(1, false)).map_err(err)?;
-            let data = unsafe {
+            b.build_store(block, i64_ty.const_int(KIND_STR, false)).map_err(err)?;
+            let rc_slot = unsafe {
                 b.build_gep(
                     ctx.i8_type(),
                     block,
                     &[i64_ty.const_int(RC_OFFSET as u64, false)],
+                    "rc.slot",
+                )
+                .map_err(err)?
+            };
+            b.build_store(rc_slot, i64_ty.const_int(1, false)).map_err(err)?;
+            let data = unsafe {
+                b.build_gep(
+                    ctx.i8_type(),
+                    block,
+                    &[i64_ty.const_int(HEADER_SIZE as u64, false)],
                     "data",
                 )
                 .map_err(err)?
