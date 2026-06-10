@@ -151,7 +151,10 @@ impl ArcInserter {
                     let body = self.process_block(body, ScopeKind::Loop);
                     out.push(Stmt::For { var, start, end, body, line });
                 }
-                other @ (Stmt::Assign { .. } | Stmt::Retain(_) | Stmt::Release(_)) => {
+                other @ (Stmt::Assign { .. }
+                | Stmt::IndexAssign { .. }
+                | Stmt::Retain(_)
+                | Stmt::Release(_)) => {
                     out.push(other);
                 }
             }
@@ -334,6 +337,15 @@ mod tests {
             panic!()
         };
         assert!(matches!(then_block.last().unwrap(), Stmt::Release(n) if n == "s"));
+    }
+
+    #[test]
+    fn arrays_are_arc_managed_like_strings() {
+        let prog = lower("fn main():\n    let xs = [1, 2]\n    print(len(xs))\n");
+        assert_eq!(balance(&prog), (0, 1), "array binding released at scope end");
+        let prog =
+            lower("fn main():\n    let xs = [\"a\"]\n    let ys = xs\n    print(len(ys))\n");
+        assert_eq!(balance(&prog), (1, 2), "alias retains; both bindings release");
     }
 
     #[test]

@@ -17,7 +17,10 @@
 //! additive   := term (("+"|"-") term)*
 //! term       := unary (("*"|"/"|"%") unary)*
 //! unary      := "-" unary | primary
-//! primary    := INT | FLOAT | STR | "true" | "false" | IDENT ["(" args ")"] | "(" expr ")"
+//! primary    := atom ("[" expr "]")*
+//! atom       := INT | FLOAT | STR | "true" | "false" | IDENT ["(" args ")"]
+//!             | "(" expr ")" | "[" [expr ("," expr)*] "]"
+//! type       := "int" | "float" | "bool" | "str" | "[" type "]"
 //! ```
 
 use crate::ast::*;
@@ -118,6 +121,16 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> PResult<Type> {
+        if self.check(&TokKind::LBracket) {
+            let elem = self.parse_type()?;
+            self.expect(TokKind::RBracket)?;
+            let Some(elem) = ElemType::from_type(elem) else {
+                return Err(self.error(format!(
+                    "`[{elem}]` is not a valid array type (nested arrays are not supported yet)"
+                )));
+            };
+            return Ok(Type::Array(elem));
+        }
         let name = self.expect_ident()?;
         match name.as_str() {
             "int" => Ok(Type::Int),
@@ -264,16 +277,27 @@ impl Parser {
                 let body = self.parse_block()?;
                 Ok(Stmt::While { cond, body })
             }
-            // Assignment or bare expression — disambiguate by lookahead.
+            // Assignment or bare expression: parse the expression first, then
+            // a trailing `=` decides — the target must be a name or an index.
             TokKind::Ident(_) => {
-                if let TokKind::Assign = self.tokens[self.pos + 1].kind {
-                    let name = self.expect_ident()?;
-                    self.advance(); // `=`
+                let expr = self.parse_expression()?;
+                if self.check(&TokKind::Assign) {
                     let value = self.parse_expression()?;
                     self.expect(TokKind::Newline)?;
-                    Ok(Stmt::Assign { name, value, line })
+                    match expr.kind {
+                        ExprKind::Var(name) => Ok(Stmt::Assign { name, value, line }),
+                        ExprKind::Index(target, index) => Ok(Stmt::IndexAssign {
+                            target: *target,
+                            index: *index,
+                            value,
+                            line,
+                        }),
+                        _ => Err(ParseError {
+                            line,
+                            message: "invalid assignment target".into(),
+                        }),
+                    }
                 } else {
-                    let expr = self.parse_expression()?;
                     self.expect(TokKind::Newline)?;
                     Ok(Stmt::Expr(expr))
                 }
@@ -453,7 +477,20 @@ impl Parser {
         }
     }
 
+    /// An atom followed by any number of `[index]` suffixes.
     fn parse_primary(&mut self) -> PResult<Expr> {
+        let mut expr = self.parse_atom()?;
+        while self.peek() == &TokKind::LBracket {
+            let line = self.line();
+            self.advance();
+            let idx = self.parse_expression()?;
+            self.expect(TokKind::RBracket)?;
+            expr = Expr::new(ExprKind::Index(Box::new(expr), Box::new(idx)), line);
+        }
+        Ok(expr)
+    }
+
+    fn parse_atom(&mut self) -> PResult<Expr> {
         let line = self.line();
         match self.peek().clone() {
             TokKind::Int(n) => {
@@ -481,6 +518,18 @@ impl Parser {
                 let inner = self.parse_expression()?;
                 self.expect(TokKind::RParen)?;
                 Ok(inner)
+            }
+            TokKind::LBracket => {
+                self.advance();
+                let mut elems = Vec::new();
+                while !self.check(&TokKind::RBracket) {
+                    elems.push(self.parse_expression()?);
+                    if !self.check(&TokKind::Comma) {
+                        self.expect(TokKind::RBracket)?;
+                        break;
+                    }
+                }
+                Ok(Expr::new(ExprKind::ArrayLit(elems), line))
             }
             TokKind::Ident(name) => {
                 self.advance();
@@ -594,6 +643,45 @@ mod tests {
         assert_eq!(name, "add");
         assert_eq!(args.len(), 2);
         assert!(matches!(&args[1].kind, ExprKind::Call(n, _) if n == "mul"));
+    }
+
+    #[test]
+    fn parses_array_literal_type_and_indexing() {
+        let src = "fn f():\n    let xs: [int] = [1, 2, 3]\n    let y = xs[0]\n";
+        let prog = parse(src).unwrap();
+        let Stmt::Let { ty, value, .. } = &prog.functions[0].body[0] else {
+            panic!("expected let");
+        };
+        assert_eq!(*ty, Some(Type::Array(ElemType::Int)));
+        let ExprKind::ArrayLit(elems) = &value.kind else {
+            panic!("expected array literal");
+        };
+        assert_eq!(elems.len(), 3);
+        let Stmt::Let { value, .. } = &prog.functions[0].body[1] else {
+            panic!("expected let");
+        };
+        assert!(matches!(&value.kind, ExprKind::Index(..)));
+    }
+
+    #[test]
+    fn parses_index_assignment() {
+        let src = "fn f(xs: [str]):\n    xs[1] = \"two\"\n";
+        let prog = parse(src).unwrap();
+        assert_eq!(prog.functions[0].params[0].ty, Type::Array(ElemType::Str));
+        assert!(matches!(
+            &prog.functions[0].body[0],
+            Stmt::IndexAssign { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_nested_array_type() {
+        assert!(parse("fn f(xs: [[int]]):\n    return\n").is_err());
+    }
+
+    #[test]
+    fn rejects_bad_assignment_target() {
+        assert!(parse("fn f():\n    f() = 1\n").is_err());
     }
 
     #[test]

@@ -3,12 +3,45 @@
 //! The parser produces this tree; semantic analysis annotates and rewrites it
 //! (notably inserting ARC retain/release), and codegen walks it.
 
+/// Element type of an array. A separate (smaller) enum keeps `Type` `Copy`;
+/// nested arrays are deferred until types grow a real arena/Box story.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElemType {
+    Int,
+    Float,
+    Bool,
+    Str,
+}
+
+impl ElemType {
+    pub fn to_type(self) -> Type {
+        match self {
+            ElemType::Int => Type::Int,
+            ElemType::Float => Type::Float,
+            ElemType::Bool => Type::Bool,
+            ElemType::Str => Type::Str,
+        }
+    }
+
+    pub fn from_type(ty: Type) -> Option<ElemType> {
+        match ty {
+            Type::Int => Some(ElemType::Int),
+            Type::Float => Some(ElemType::Float),
+            Type::Bool => Some(ElemType::Bool),
+            Type::Str => Some(ElemType::Str),
+            Type::Array(_) | Type::Unit => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
     Int,
     Float,
     Bool,
     Str,
+    /// `[T]` — a growable, reference-counted array.
+    Array(ElemType),
     /// The "no value" type of statements and functions without `-> T`.
     Unit,
 }
@@ -16,20 +49,20 @@ pub enum Type {
 impl Type {
     /// Heap-allocated, reference-counted types managed by ARC.
     pub fn is_heap(self) -> bool {
-        matches!(self, Type::Str)
+        matches!(self, Type::Str | Type::Array(_))
     }
 }
 
 impl std::fmt::Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Type::Int => "int",
-            Type::Float => "float",
-            Type::Bool => "bool",
-            Type::Str => "str",
-            Type::Unit => "unit",
-        };
-        write!(f, "{s}")
+        match self {
+            Type::Int => write!(f, "int"),
+            Type::Float => write!(f, "float"),
+            Type::Bool => write!(f, "bool"),
+            Type::Str => write!(f, "str"),
+            Type::Array(e) => write!(f, "[{}]", e.to_type()),
+            Type::Unit => write!(f, "unit"),
+        }
     }
 }
 
@@ -80,6 +113,10 @@ pub enum ExprKind {
     Unary(UnOp, Box<Expr>),
     Binary(Box<Expr>, BinOp, Box<Expr>),
     Call(String, Vec<Expr>),
+    /// `[e1, e2, ...]` — an empty literal needs a type annotation.
+    ArrayLit(Vec<Expr>),
+    /// `base[index]`
+    Index(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -92,6 +129,13 @@ pub enum Stmt {
     },
     Assign {
         name: String,
+        value: Expr,
+        line: usize,
+    },
+    /// `target[index] = value`
+    IndexAssign {
+        target: Expr,
+        index: Expr,
         value: Expr,
         line: usize,
     },

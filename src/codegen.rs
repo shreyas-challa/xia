@@ -91,6 +91,7 @@ impl<'ctx> CodeGen<'ctx> {
             Type::Float => self.context.f64_type().into(),
             Type::Bool => self.context.bool_type().into(),
             Type::Str => self.context.ptr_type(AddressSpace::default()).into(),
+            Type::Array(_) => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Unit => unreachable!("unit has no basic type"),
         }
     }
@@ -275,6 +276,21 @@ impl<'ctx> CodeGen<'ctx> {
                 } else {
                     self.builder.build_store(slot, new_val).map_err(err)?;
                 }
+                self.flush_temps(0)
+            }
+            Stmt::IndexAssign { target, index, value, .. } => {
+                let Some(Type::Array(elem)) = target.ty else {
+                    return Err("codegen: index-assign target is not an array".into());
+                };
+                let arr = self.compile_expr(target)?.into_pointer_value();
+                let idx = self.compile_expr(index)?.into_int_value();
+                let v = self.compile_expr(value)?;
+                let w = self.to_word(v, elem)?;
+                // xia_arr_set retains the new element / releases the old one.
+                let set_fn = self.get_or_build_arr_set()?;
+                self.builder
+                    .build_call(set_fn, &[arr.into(), idx.into(), w.into()], "")
+                    .map_err(err)?;
                 self.flush_temps(0)
             }
             Stmt::Expr(e) => {
@@ -517,6 +533,112 @@ impl<'ctx> CodeGen<'ctx> {
                 self.compile_call(name, args, e.line)?
                     .ok_or_else(|| format!("codegen: `{name}` returns no value (line {})", e.line))
             }
+            ExprKind::ArrayLit(elems) => {
+                let Some(Type::Array(elem)) = e.ty else {
+                    return Err("codegen: array literal without array type".into());
+                };
+                let i64_ty = self.context.i64_type();
+                let kind = if elem.to_type().is_heap() { KIND_ARR_HEAP } else { KIND_ARR };
+                let cap = (elems.len() as u64).max(4);
+                let new_fn = self.get_or_build_arr_new()?;
+                let arr = self
+                    .builder
+                    .build_call(
+                        new_fn,
+                        &[
+                            i64_ty.const_int(kind, false).into(),
+                            i64_ty.const_int(cap, false).into(),
+                        ],
+                        "arr",
+                    )
+                    .map_err(err)?
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_pointer_value();
+                let push_fn = self.get_or_build_arr_push()?;
+                for el in elems {
+                    let v = self.compile_expr(el)?;
+                    let w = self.to_word(v, elem)?;
+                    self.builder
+                        .build_call(push_fn, &[arr.into(), w.into()], "")
+                        .map_err(err)?;
+                }
+                self.stmt_temps.push(arr);
+                Ok(arr.into())
+            }
+            ExprKind::Index(base, index) => {
+                let Some(Type::Array(elem)) = base.ty else {
+                    return Err("codegen: indexing a non-array".into());
+                };
+                let arr = self.compile_expr(base)?.into_pointer_value();
+                let idx = self.compile_expr(index)?.into_int_value();
+                let get_fn = self.get_or_build_arr_get()?;
+                let raw = self
+                    .builder
+                    .build_call(get_fn, &[arr.into(), idx.into()], "elem")
+                    .map_err(err)?
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_int_value();
+                let v = self.from_word(raw, elem)?;
+                if elem.to_type().is_heap() {
+                    // xia_arr_get returns heap elements retained (+1).
+                    self.stmt_temps.push(v.into_pointer_value());
+                }
+                Ok(v)
+            }
+        }
+    }
+
+    /// Pack a value into the 8-byte word stored in an array buffer.
+    fn to_word(
+        &mut self,
+        v: BasicValueEnum<'ctx>,
+        elem: ElemType,
+    ) -> CResult<inkwell::values::IntValue<'ctx>> {
+        let i64_ty = self.context.i64_type();
+        match elem {
+            ElemType::Int => Ok(v.into_int_value()),
+            ElemType::Float => Ok(self
+                .builder
+                .build_bit_cast(v.into_float_value(), i64_ty, "fbits")
+                .map_err(err)?
+                .into_int_value()),
+            ElemType::Bool => self
+                .builder
+                .build_int_z_extend(v.into_int_value(), i64_ty, "bword")
+                .map_err(err),
+            ElemType::Str => self
+                .builder
+                .build_ptr_to_int(v.into_pointer_value(), i64_ty, "pword")
+                .map_err(err),
+        }
+    }
+
+    /// Unpack an 8-byte array word back into a typed value.
+    fn from_word(
+        &mut self,
+        w: inkwell::values::IntValue<'ctx>,
+        elem: ElemType,
+    ) -> CResult<BasicValueEnum<'ctx>> {
+        match elem {
+            ElemType::Int => Ok(w.into()),
+            ElemType::Float => Ok(self
+                .builder
+                .build_bit_cast(w, self.context.f64_type(), "fval")
+                .map_err(err)?),
+            ElemType::Bool => Ok(self
+                .builder
+                .build_int_truncate(w, self.context.bool_type(), "bval")
+                .map_err(err)?
+                .into()),
+            ElemType::Str => Ok(self
+                .builder
+                .build_int_to_ptr(w, self.ptr_ty(), "pval")
+                .map_err(err)?
+                .into()),
         }
     }
 
@@ -704,6 +826,46 @@ impl<'ctx> CodeGen<'ctx> {
         if name == "print" {
             return self.compile_print(&args[0]).map(|_| None);
         }
+        if name == "len" {
+            let arg = &args[0];
+            let v = self.compile_expr(arg)?;
+            let out = match arg.ty.unwrap() {
+                Type::Str => {
+                    let i64_ty = self.context.i64_type();
+                    let strlen_ty = i64_ty.fn_type(&[self.ptr_ty().into()], false);
+                    let (strlen_ptr, strlen_fnty) = self.libc("strlen", strlen_ty);
+                    self.builder
+                        .build_indirect_call(strlen_fnty, strlen_ptr, &[v.into()], "len")
+                        .map_err(err)?
+                        .try_as_basic_value()
+                        .left()
+                        .unwrap()
+                }
+                Type::Array(_) => {
+                    // The array value points directly at its length field.
+                    self.builder
+                        .build_load(self.context.i64_type(), v.into_pointer_value(), "len")
+                        .map_err(err)?
+                }
+                other => return Err(format!("codegen: len of {other}")),
+            };
+            return Ok(Some(out));
+        }
+        if name == "push" {
+            let Some(Type::Array(elem)) = args[0].ty else {
+                return Err("codegen: push to a non-array".into());
+            };
+            let arr = self.compile_expr(&args[0])?.into_pointer_value();
+            let v = self.compile_expr(&args[1])?;
+            let w = self.to_word(v, elem)?;
+            // xia_arr_push retains heap elements; a fresh temp's own +1 is
+            // then dropped by the statement flush, leaving the array's ref.
+            let push_fn = self.get_or_build_arr_push()?;
+            self.builder
+                .build_call(push_fn, &[arr.into(), w.into()], "")
+                .map_err(err)?;
+            return Ok(None);
+        }
         let callee_name = if name == "main" { "xia_main" } else { name };
         let callee = self
             .module
@@ -757,7 +919,9 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(err)?;
                 ("%s\n", sel.into())
             }
-            Type::Unit => return Err("codegen: cannot print unit".into()),
+            Type::Array(_) | Type::Unit => {
+                return Err("codegen: cannot print this type".into());
+            }
         };
         let fmt_ptr = self.str_literal(fmt)?;
         let printf = self.libc_printf();
@@ -1247,6 +1411,325 @@ impl<'ctx> CodeGen<'ctx> {
             Ok(())
         })
     }
+
+    // ----- array runtime ----------------------------------------------------
+
+    /// `xia_arr_new(kind, cap) -> ptr`: allocate the handle block and an
+    /// element buffer of `cap` 8-byte words; len starts at 0, refcount at 1.
+    fn get_or_build_arr_new(&mut self) -> CResult<FunctionValue<'ctx>> {
+        let i64_ty = self.context.i64_type();
+        let ty = self
+            .ptr_ty()
+            .fn_type(&[i64_ty.into(), i64_ty.into()], false);
+        let ctx = self.context;
+        let malloc_ty = self.ptr_ty().fn_type(&[i64_ty.into()], false);
+        let (malloc_ptr, malloc_fnty) = self.libc("malloc", malloc_ty);
+        self.build_runtime_fn("xia_arr_new", ty, |b, f| {
+            let kind = f.get_nth_param(0).unwrap().into_int_value();
+            let cap = f.get_nth_param(1).unwrap().into_int_value();
+            let entry = ctx.append_basic_block(f, "entry");
+            b.position_at_end(entry);
+            // [kind][rc][len][cap][data ptr] = 40 bytes
+            let block = b
+                .build_indirect_call(
+                    malloc_fnty,
+                    malloc_ptr,
+                    &[i64_ty.const_int(40, false).into()],
+                    "block",
+                )
+                .map_err(err)?
+                .try_as_basic_value()
+                .left()
+                .unwrap()
+                .into_pointer_value();
+            b.build_store(block, kind).map_err(err)?;
+            let rc_slot = self.arr_field(b, block, RC_OFFSET as u64, "rc.slot")?;
+            b.build_store(rc_slot, i64_ty.const_int(1, false)).map_err(err)?;
+            let val = self.arr_field(b, block, HEADER_SIZE as u64, "val")?;
+            b.build_store(val, i64_ty.const_zero()).map_err(err)?;
+            let cap_slot = self.arr_field(b, val, ARR_CAP_OFFSET, "cap.slot")?;
+            b.build_store(cap_slot, cap).map_err(err)?;
+            let bytes = b
+                .build_int_mul(cap, i64_ty.const_int(8, false), "bytes")
+                .map_err(err)?;
+            let data = b
+                .build_indirect_call(malloc_fnty, malloc_ptr, &[bytes.into()], "data")
+                .map_err(err)?
+                .try_as_basic_value()
+                .left()
+                .unwrap()
+                .into_pointer_value();
+            let data_slot = self.arr_field(b, val, ARR_DATA_OFFSET, "data.slot")?;
+            b.build_store(data_slot, data).map_err(err)?;
+            b.build_return(Some(&val)).map_err(err)?;
+            Ok(())
+        })
+    }
+
+    /// `xia_arr_push(arr, word)`: append, doubling the buffer when full.
+    /// Heap elements are retained — the array owns its own reference.
+    fn get_or_build_arr_push(&mut self) -> CResult<FunctionValue<'ctx>> {
+        let i64_ty = self.context.i64_type();
+        let ptr_ty = self.ptr_ty();
+        let void = self.context.void_type();
+        let ty = void.fn_type(&[ptr_ty.into(), i64_ty.into()], false);
+        let ctx = self.context;
+        let malloc_ty = ptr_ty.fn_type(&[i64_ty.into()], false);
+        let (malloc_ptr, malloc_fnty) = self.libc("malloc", malloc_ty);
+        let free_ty = void.fn_type(&[ptr_ty.into()], false);
+        let (free_ptr, free_fnty) = self.libc("free", free_ty);
+        let retain = self.get_or_build_retain()?;
+        self.build_runtime_fn("xia_arr_push", ty, |b, f| {
+            let arr = f.get_nth_param(0).unwrap().into_pointer_value();
+            let val = f.get_nth_param(1).unwrap().into_int_value();
+            let entry = ctx.append_basic_block(f, "entry");
+            let grow = ctx.append_basic_block(f, "grow");
+            let store = ctx.append_basic_block(f, "store");
+
+            b.position_at_end(entry);
+            let len = b.build_load(i64_ty, arr, "len").map_err(err)?.into_int_value();
+            let cap_slot = self.arr_field(b, arr, ARR_CAP_OFFSET, "cap.slot")?;
+            let cap = b.build_load(i64_ty, cap_slot, "cap").map_err(err)?.into_int_value();
+            let full = b
+                .build_int_compare(IntPredicate::EQ, len, cap, "full")
+                .map_err(err)?;
+            b.build_conditional_branch(full, grow, store).map_err(err)?;
+
+            b.position_at_end(grow);
+            let newcap = b
+                .build_int_mul(cap, i64_ty.const_int(2, false), "newcap")
+                .map_err(err)?;
+            let newbytes = b
+                .build_int_mul(newcap, i64_ty.const_int(8, false), "newbytes")
+                .map_err(err)?;
+            let newdata = b
+                .build_indirect_call(malloc_fnty, malloc_ptr, &[newbytes.into()], "newdata")
+                .map_err(err)?
+                .try_as_basic_value()
+                .left()
+                .unwrap()
+                .into_pointer_value();
+            let data_slot = self.arr_field(b, arr, ARR_DATA_OFFSET, "data.slot")?;
+            let olddata = b
+                .build_load(ptr_ty, data_slot, "olddata")
+                .map_err(err)?
+                .into_pointer_value();
+            let used = b
+                .build_int_mul(len, i64_ty.const_int(8, false), "used")
+                .map_err(err)?;
+            b.build_memcpy(newdata, 8, olddata, 8, used).map_err(err)?;
+            b.build_indirect_call(free_fnty, free_ptr, &[olddata.into()], "")
+                .map_err(err)?;
+            b.build_store(data_slot, newdata).map_err(err)?;
+            b.build_store(cap_slot, newcap).map_err(err)?;
+            b.build_unconditional_branch(store).map_err(err)?;
+
+            b.position_at_end(store);
+            let block = self.block_ptr(b, arr)?;
+            let kind = b.build_load(i64_ty, block, "kind").map_err(err)?.into_int_value();
+            let heap = b
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    kind,
+                    i64_ty.const_int(KIND_ARR_HEAP, false),
+                    "heap",
+                )
+                .map_err(err)?;
+            let retain_bb = ctx.append_basic_block(f, "retain");
+            let write = ctx.append_basic_block(f, "write");
+            b.build_conditional_branch(heap, retain_bb, write).map_err(err)?;
+
+            b.position_at_end(retain_bb);
+            let as_ptr = b.build_int_to_ptr(val, ptr_ty, "val.ptr").map_err(err)?;
+            b.build_call(retain, &[as_ptr.into()], "").map_err(err)?;
+            b.build_unconditional_branch(write).map_err(err)?;
+
+            b.position_at_end(write);
+            let data_slot = self.arr_field(b, arr, ARR_DATA_OFFSET, "data.slot")?;
+            let data = b
+                .build_load(ptr_ty, data_slot, "data")
+                .map_err(err)?
+                .into_pointer_value();
+            let slot = unsafe {
+                b.build_gep(i64_ty, data, &[len], "slot").map_err(err)?
+            };
+            b.build_store(slot, val).map_err(err)?;
+            let newlen = b
+                .build_int_add(len, i64_ty.const_int(1, false), "newlen")
+                .map_err(err)?;
+            b.build_store(arr, newlen).map_err(err)?;
+            b.build_return(None).map_err(err)?;
+            Ok(())
+        })
+    }
+
+    /// `xia_bounds_fail(idx, len)`: print a diagnostic and exit(1).
+    fn get_or_build_bounds_fail(&mut self) -> CResult<FunctionValue<'ctx>> {
+        let i64_ty = self.context.i64_type();
+        let void = self.context.void_type();
+        let ty = void.fn_type(&[i64_ty.into(), i64_ty.into()], false);
+        let ctx = self.context;
+        let fmt = self.str_literal("xia: index %lld out of bounds for array of length %lld\n")?;
+        let (printf_ptr, printf_fnty) = self.libc_printf();
+        let exit_ty = void.fn_type(&[self.context.i32_type().into()], false);
+        let (exit_ptr, exit_fnty) = self.libc("exit", exit_ty);
+        self.build_runtime_fn("xia_bounds_fail", ty, |b, f| {
+            let idx = f.get_nth_param(0).unwrap();
+            let len = f.get_nth_param(1).unwrap();
+            let entry = ctx.append_basic_block(f, "entry");
+            b.position_at_end(entry);
+            b.build_indirect_call(
+                printf_fnty,
+                printf_ptr,
+                &[fmt.into(), idx.into(), len.into()],
+                "",
+            )
+            .map_err(err)?;
+            b.build_indirect_call(
+                exit_fnty,
+                exit_ptr,
+                &[ctx.i32_type().const_int(1, false).into()],
+                "",
+            )
+            .map_err(err)?;
+            b.build_unreachable().map_err(err)?;
+            Ok(())
+        })
+    }
+
+    /// `xia_arr_get(arr, idx) -> word`: bounds-checked load. Heap elements
+    /// come back retained (+1) so the caller owns what it received.
+    fn get_or_build_arr_get(&mut self) -> CResult<FunctionValue<'ctx>> {
+        let i64_ty = self.context.i64_type();
+        let ptr_ty = self.ptr_ty();
+        let ty = i64_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false);
+        let ctx = self.context;
+        let bounds_fail = self.get_or_build_bounds_fail()?;
+        let retain = self.get_or_build_retain()?;
+        self.build_runtime_fn("xia_arr_get", ty, |b, f| {
+            let arr = f.get_nth_param(0).unwrap().into_pointer_value();
+            let idx = f.get_nth_param(1).unwrap().into_int_value();
+            let entry = ctx.append_basic_block(f, "entry");
+            let trap = ctx.append_basic_block(f, "trap");
+            let load = ctx.append_basic_block(f, "load");
+            let retain_bb = ctx.append_basic_block(f, "retain");
+            let done = ctx.append_basic_block(f, "done");
+
+            b.position_at_end(entry);
+            let len = b.build_load(i64_ty, arr, "len").map_err(err)?.into_int_value();
+            // Unsigned compare folds the `idx < 0` case in: it wraps huge.
+            let ok = b
+                .build_int_compare(IntPredicate::ULT, idx, len, "ok")
+                .map_err(err)?;
+            b.build_conditional_branch(ok, load, trap).map_err(err)?;
+
+            b.position_at_end(trap);
+            b.build_call(bounds_fail, &[idx.into(), len.into()], "")
+                .map_err(err)?;
+            b.build_unreachable().map_err(err)?;
+
+            b.position_at_end(load);
+            let data_slot = self.arr_field(b, arr, ARR_DATA_OFFSET, "data.slot")?;
+            let data = b
+                .build_load(ptr_ty, data_slot, "data")
+                .map_err(err)?
+                .into_pointer_value();
+            let slot = unsafe {
+                b.build_gep(i64_ty, data, &[idx], "slot").map_err(err)?
+            };
+            let word = b.build_load(i64_ty, slot, "word").map_err(err)?.into_int_value();
+            let block = self.block_ptr(b, arr)?;
+            let kind = b.build_load(i64_ty, block, "kind").map_err(err)?.into_int_value();
+            let heap = b
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    kind,
+                    i64_ty.const_int(KIND_ARR_HEAP, false),
+                    "heap",
+                )
+                .map_err(err)?;
+            b.build_conditional_branch(heap, retain_bb, done).map_err(err)?;
+
+            b.position_at_end(retain_bb);
+            let as_ptr = b.build_int_to_ptr(word, ptr_ty, "word.ptr").map_err(err)?;
+            b.build_call(retain, &[as_ptr.into()], "").map_err(err)?;
+            b.build_unconditional_branch(done).map_err(err)?;
+
+            b.position_at_end(done);
+            b.build_return(Some(&word)).map_err(err)?;
+            Ok(())
+        })
+    }
+
+    /// `xia_arr_set(arr, idx, word)`: bounds-checked store. For heap elements
+    /// the new value is retained before the old one is released, so
+    /// `xs[i] = xs[i]` is safe.
+    fn get_or_build_arr_set(&mut self) -> CResult<FunctionValue<'ctx>> {
+        let i64_ty = self.context.i64_type();
+        let ptr_ty = self.ptr_ty();
+        let void = self.context.void_type();
+        let ty = void.fn_type(&[ptr_ty.into(), i64_ty.into(), i64_ty.into()], false);
+        let ctx = self.context;
+        let bounds_fail = self.get_or_build_bounds_fail()?;
+        let retain = self.get_or_build_retain()?;
+        let release = self.get_or_build_release()?;
+        self.build_runtime_fn("xia_arr_set", ty, |b, f| {
+            let arr = f.get_nth_param(0).unwrap().into_pointer_value();
+            let idx = f.get_nth_param(1).unwrap().into_int_value();
+            let val = f.get_nth_param(2).unwrap().into_int_value();
+            let entry = ctx.append_basic_block(f, "entry");
+            let trap = ctx.append_basic_block(f, "trap");
+            let check = ctx.append_basic_block(f, "check");
+            let swap = ctx.append_basic_block(f, "swap");
+            let write = ctx.append_basic_block(f, "write");
+
+            b.position_at_end(entry);
+            let len = b.build_load(i64_ty, arr, "len").map_err(err)?.into_int_value();
+            let ok = b
+                .build_int_compare(IntPredicate::ULT, idx, len, "ok")
+                .map_err(err)?;
+            b.build_conditional_branch(ok, check, trap).map_err(err)?;
+
+            b.position_at_end(trap);
+            b.build_call(bounds_fail, &[idx.into(), len.into()], "")
+                .map_err(err)?;
+            b.build_unreachable().map_err(err)?;
+
+            b.position_at_end(check);
+            let data_slot = self.arr_field(b, arr, ARR_DATA_OFFSET, "data.slot")?;
+            let data = b
+                .build_load(ptr_ty, data_slot, "data")
+                .map_err(err)?
+                .into_pointer_value();
+            let slot = unsafe {
+                b.build_gep(i64_ty, data, &[idx], "slot").map_err(err)?
+            };
+            let block = self.block_ptr(b, arr)?;
+            let kind = b.build_load(i64_ty, block, "kind").map_err(err)?.into_int_value();
+            let heap = b
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    kind,
+                    i64_ty.const_int(KIND_ARR_HEAP, false),
+                    "heap",
+                )
+                .map_err(err)?;
+            b.build_conditional_branch(heap, swap, write).map_err(err)?;
+
+            b.position_at_end(swap);
+            let new_ptr = b.build_int_to_ptr(val, ptr_ty, "new.ptr").map_err(err)?;
+            b.build_call(retain, &[new_ptr.into()], "").map_err(err)?;
+            let old = b.build_load(i64_ty, slot, "old").map_err(err)?.into_int_value();
+            let old_ptr = b.build_int_to_ptr(old, ptr_ty, "old.ptr").map_err(err)?;
+            b.build_call(release, &[old_ptr.into()], "").map_err(err)?;
+            b.build_unconditional_branch(write).map_err(err)?;
+
+            b.position_at_end(write);
+            b.build_store(slot, val).map_err(err)?;
+            b.build_return(None).map_err(err)?;
+            Ok(())
+        })
+    }
 }
 
 fn err(e: inkwell::builder::BuilderError) -> String {
@@ -1367,6 +1850,26 @@ mod tests {
         let src = "extern fn getenv(name: str) -> str\nfn main():\n    let p = getenv(\"PATH\")\n    print(p)\n";
         let ir = compile_to_ir(src).unwrap();
         assert!(ir.contains("xia_str_dup"));
+    }
+
+    #[test]
+    fn arrays_lower_to_runtime_calls() {
+        let src = "fn main() -> int:\n    let xs = [10, 20, 30]\n    xs[1] = 5\n    push(xs, 40)\n    return xs[1] + len(xs)\n";
+        let ir = compile_to_ir(src).unwrap();
+        assert!(ir.contains("xia_arr_new"));
+        assert!(ir.contains("xia_arr_push"));
+        assert!(ir.contains("xia_arr_get"));
+        assert!(ir.contains("xia_arr_set"));
+        assert!(ir.contains("xia_bounds_fail"));
+    }
+
+    #[test]
+    fn str_arrays_use_heap_element_kind() {
+        let src = "fn main():\n    let xs = [\"a\", \"b\"]\n    print(xs[0])\n";
+        let ir = compile_to_ir(src).unwrap();
+        // kind 2 = heap elements; release loops over them when the array dies
+        assert!(ir.contains("@xia_arr_new(i64 2,"));
+        assert!(ir.contains("elem.loop"));
     }
 
     #[test]

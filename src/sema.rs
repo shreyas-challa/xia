@@ -146,6 +146,28 @@ impl Analyzer {
     fn check_stmt(&mut self, stmt: &mut Stmt) -> SResult<()> {
         match stmt {
             Stmt::Let { name, ty, value, line } => {
+                // An empty array literal has no type of its own; it takes the
+                // annotated one (`let xs: [int] = []`).
+                if let ExprKind::ArrayLit(elems) = &value.kind {
+                    if elems.is_empty() {
+                        let Some(annotated @ Type::Array(_)) = ty else {
+                            return Err(SemaError {
+                                line: *line,
+                                message: format!(
+                                    "cannot infer the element type of `[]`; annotate the binding, e.g. `let {name}: [int] = []`"
+                                ),
+                            });
+                        };
+                        value.ty = Some(*annotated);
+                        if !self.symbols.declare(name, *annotated) {
+                            return Err(SemaError {
+                                line: *line,
+                                message: format!("`{name}` is already defined in this scope"),
+                            });
+                        }
+                        return Ok(());
+                    }
+                }
                 let inferred = self.check_expr(value)?;
                 if inferred == Type::Unit {
                     return Err(SemaError {
@@ -185,6 +207,33 @@ impl Analyzer {
                         line: *line,
                         message: format!(
                             "type mismatch: cannot assign {val_ty} to `{name}` of type {var_ty}"
+                        ),
+                    });
+                }
+                Ok(())
+            }
+            Stmt::IndexAssign { target, index, value, line } => {
+                let target_ty = self.check_expr(target)?;
+                let Type::Array(elem) = target_ty else {
+                    return Err(SemaError {
+                        line: *line,
+                        message: format!("cannot index-assign into a value of type {target_ty}"),
+                    });
+                };
+                let idx_ty = self.check_expr(index)?;
+                if idx_ty != Type::Int {
+                    return Err(SemaError {
+                        line: *line,
+                        message: format!("array index must be int, found {idx_ty}"),
+                    });
+                }
+                let val_ty = self.check_expr(value)?;
+                if val_ty != elem.to_type() {
+                    return Err(SemaError {
+                        line: *line,
+                        message: format!(
+                            "type mismatch: cannot store {val_ty} in an array of {}",
+                            elem.to_type()
                         ),
                     });
                 }
@@ -322,10 +371,10 @@ impl Analyzer {
                         }
                     }
                     BinOp::Eq | BinOp::Ne => {
-                        if lt == Type::Unit {
+                        if lt == Type::Unit || matches!(lt, Type::Array(_)) {
                             return Err(SemaError {
                                 line,
-                                message: "cannot compare unit values".into(),
+                                message: format!("cannot compare values of type {lt}"),
                             });
                         }
                         Type::Bool
@@ -363,10 +412,50 @@ impl Analyzer {
                         });
                     }
                     let t = self.check_expr(&mut args[0])?;
-                    if t == Type::Unit {
+                    if t == Type::Unit || matches!(t, Type::Array(_)) {
                         return Err(SemaError {
                             line,
-                            message: "cannot print a unit value".into(),
+                            message: format!("cannot print a value of type {t}"),
+                        });
+                    }
+                    Type::Unit
+                } else if name == "len" {
+                    if args.len() != 1 {
+                        return Err(SemaError {
+                            line,
+                            message: format!("len takes exactly 1 argument, got {}", args.len()),
+                        });
+                    }
+                    let t = self.check_expr(&mut args[0])?;
+                    if t != Type::Str && !matches!(t, Type::Array(_)) {
+                        return Err(SemaError {
+                            line,
+                            message: format!("len requires a str or array, found {t}"),
+                        });
+                    }
+                    Type::Int
+                } else if name == "push" {
+                    if args.len() != 2 {
+                        return Err(SemaError {
+                            line,
+                            message: format!("push takes exactly 2 arguments, got {}", args.len()),
+                        });
+                    }
+                    let arr_ty = self.check_expr(&mut args[0])?;
+                    let Type::Array(elem) = arr_ty else {
+                        return Err(SemaError {
+                            line,
+                            message: format!("push requires an array, found {arr_ty}"),
+                        });
+                    };
+                    let val_ty = self.check_expr(&mut args[1])?;
+                    if val_ty != elem.to_type() {
+                        return Err(SemaError {
+                            line,
+                            message: format!(
+                                "cannot push {val_ty} onto an array of {}",
+                                elem.to_type()
+                            ),
                         });
                     }
                     Type::Unit
@@ -413,6 +502,52 @@ impl Analyzer {
                     }
                     sig.ret
                 }
+            }
+            ExprKind::ArrayLit(elems) => {
+                let line = expr.line;
+                if elems.is_empty() {
+                    return Err(SemaError {
+                        line,
+                        message: "cannot infer the element type of `[]` here".into(),
+                    });
+                }
+                let first = self.check_expr(&mut elems[0])?;
+                let Some(elem) = ElemType::from_type(first) else {
+                    return Err(SemaError {
+                        line,
+                        message: format!("arrays of {first} are not supported"),
+                    });
+                };
+                for e in elems.iter_mut().skip(1) {
+                    let t = self.check_expr(e)?;
+                    if t != first {
+                        return Err(SemaError {
+                            line: e.line,
+                            message: format!(
+                                "array elements must all have the same type: expected {first}, found {t}"
+                            ),
+                        });
+                    }
+                }
+                Type::Array(elem)
+            }
+            ExprKind::Index(base, index) => {
+                let line = expr.line;
+                let base_ty = self.check_expr(base)?;
+                let Type::Array(elem) = base_ty else {
+                    return Err(SemaError {
+                        line,
+                        message: format!("cannot index a value of type {base_ty}"),
+                    });
+                };
+                let idx_ty = self.check_expr(index)?;
+                if idx_ty != Type::Int {
+                    return Err(SemaError {
+                        line,
+                        message: format!("array index must be int, found {idx_ty}"),
+                    });
+                }
+                elem.to_type()
             }
         };
         expr.ty = Some(ty);
@@ -493,6 +628,50 @@ mod tests {
     #[test]
     fn break_outside_loop_rejected() {
         assert!(analyze("fn main():\n    break\n").is_err());
+    }
+
+    #[test]
+    fn array_literal_infers_and_checks() {
+        let prog =
+            analyze("fn main():\n    let xs = [1, 2, 3]\n    print(xs[0] + 1)\n").unwrap();
+        let Stmt::Let { ty, .. } = &prog.functions[0].body[0] else {
+            panic!()
+        };
+        assert_eq!(*ty, Some(Type::Array(ElemType::Int)));
+        assert!(analyze("fn main():\n    let xs = [1, true]\n").is_err());
+        assert!(analyze("fn main():\n    let xs = [1]\n    let y = xs[true]\n").is_err());
+    }
+
+    #[test]
+    fn empty_array_needs_annotation() {
+        assert!(analyze("fn main():\n    let xs = []\n").is_err());
+        assert!(
+            analyze("fn main():\n    let xs: [str] = []\n    push(xs, \"a\")\n    print(len(xs))\n")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn push_and_len_builtins_type_check() {
+        assert!(analyze("fn main():\n    let xs = [1]\n    push(xs, \"a\")\n").is_err());
+        assert!(analyze("fn main():\n    push(1, 2)\n").is_err());
+        assert!(analyze("fn main():\n    print(len(\"abc\"))\n").is_ok());
+        assert!(analyze("fn main():\n    print(len(5))\n").is_err());
+    }
+
+    #[test]
+    fn arrays_not_printable_or_comparable() {
+        assert!(analyze("fn main():\n    let xs = [1]\n    print(xs)\n").is_err());
+        assert!(
+            analyze("fn main():\n    let a = [1]\n    let b = [1]\n    let e = a == b\n").is_err()
+        );
+    }
+
+    #[test]
+    fn index_assign_checks_types() {
+        assert!(analyze("fn main():\n    let xs = [1]\n    xs[0] = 2\n").is_ok());
+        assert!(analyze("fn main():\n    let xs = [1]\n    xs[0] = \"s\"\n").is_err());
+        assert!(analyze("fn main():\n    let s = \"x\"\n    s[0] = \"y\"\n").is_err());
     }
 
     #[test]
