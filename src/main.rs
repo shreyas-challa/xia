@@ -5,6 +5,7 @@ mod arc;
 mod ast;
 mod backend;
 mod codegen;
+mod diag;
 mod lexer;
 mod linker;
 mod parser;
@@ -102,10 +103,15 @@ fn pick_opt(release: bool, opt_size: bool) -> OptLevel {
 fn frontend(file: &Path) -> Result<ast::Program, String> {
     let source = std::fs::read_to_string(file)
         .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
-    let mut program = parser::parse(&source).map_err(|e| e.to_string())?;
+    let path = file.display().to_string();
+    let render = |d: diag::Diagnostic| d.render(&path, &source);
+    let tokens = lexer::lex(&source).map_err(|e| render(e.into()))?;
+    let mut program = parser::Parser::new(tokens)
+        .parse_program()
+        .map_err(|e| render(e.into()))?;
     sema::Analyzer::new()
         .analyze(&mut program)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| render(e.into()))?;
     Ok(program)
 }
 

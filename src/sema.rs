@@ -6,18 +6,19 @@
 //!   them type-check like normal calls (varargs allowed).
 
 use crate::ast::*;
+use crate::diag::Span;
 use std::collections::HashMap;
 use std::fmt;
 
 #[derive(Debug, Clone)]
 pub struct SemaError {
-    pub line: usize,
+    pub span: Span,
     pub message: String,
 }
 
 impl fmt::Display for SemaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "semantic error (line {}): {}", self.line, self.message)
+        write!(f, "semantic error (line {}): {}", self.span.line, self.message)
     }
 }
 
@@ -30,7 +31,6 @@ pub struct FnSig {
     pub params: Vec<Type>,
     pub varargs: bool,
     pub ret: Type,
-    pub is_extern: bool,
 }
 
 /// A stack of lexical scopes mapping variable name -> type.
@@ -89,11 +89,10 @@ impl Analyzer {
                 params: e.params.clone(),
                 varargs: e.varargs,
                 ret: e.ret,
-                is_extern: true,
             };
             if self.functions.insert(e.name.clone(), sig).is_some() {
                 return Err(SemaError {
-                    line: e.line,
+                    span: Span::line_only(e.line),
                     message: format!("duplicate declaration of `{}`", e.name),
                 });
             }
@@ -103,11 +102,10 @@ impl Analyzer {
                 params: f.params.iter().map(|p| p.ty).collect(),
                 varargs: false,
                 ret: f.ret,
-                is_extern: false,
             };
             if self.functions.insert(f.name.clone(), sig).is_some() {
                 return Err(SemaError {
-                    line: f.line,
+                    span: Span::line_only(f.line),
                     message: format!("duplicate definition of `{}`", f.name),
                 });
             }
@@ -125,7 +123,7 @@ impl Analyzer {
         for p in &f.params {
             if !self.symbols.declare(&p.name, p.ty) {
                 return Err(SemaError {
-                    line: f.line,
+                    span: Span::line_only(f.line),
                     message: format!("duplicate parameter `{}` in `{}`", p.name, f.name),
                 });
             }
@@ -145,14 +143,14 @@ impl Analyzer {
 
     fn check_stmt(&mut self, stmt: &mut Stmt) -> SResult<()> {
         match stmt {
-            Stmt::Let { name, ty, value, line } => {
+            Stmt::Let { name, ty, value, line: _ } => {
                 // An empty array literal has no type of its own; it takes the
                 // annotated one (`let xs: [int] = []`).
                 if let ExprKind::ArrayLit(elems) = &value.kind {
                     if elems.is_empty() {
                         let Some(annotated @ Type::Array(_)) = ty else {
                             return Err(SemaError {
-                                line: *line,
+                                span: value.span,
                                 message: format!(
                                     "cannot infer the element type of `[]`; annotate the binding, e.g. `let {name}: [int] = []`"
                                 ),
@@ -161,7 +159,7 @@ impl Analyzer {
                         value.ty = Some(*annotated);
                         if !self.symbols.declare(name, *annotated) {
                             return Err(SemaError {
-                                line: *line,
+                                span: value.span,
                                 message: format!("`{name}` is already defined in this scope"),
                             });
                         }
@@ -171,14 +169,14 @@ impl Analyzer {
                 let inferred = self.check_expr(value)?;
                 if inferred == Type::Unit {
                     return Err(SemaError {
-                        line: *line,
+                        span: value.span,
                         message: format!("cannot bind `{name}` to a unit (no-value) expression"),
                     });
                 }
                 if let Some(annotated) = ty {
                     if *annotated != inferred {
                         return Err(SemaError {
-                            line: *line,
+                            span: value.span,
                             message: format!(
                                 "type mismatch: `{name}` declared as {annotated} but initialized with {inferred}"
                             ),
@@ -188,7 +186,7 @@ impl Analyzer {
                 *ty = Some(inferred);
                 if !self.symbols.declare(name, inferred) {
                     return Err(SemaError {
-                        line: *line,
+                        span: value.span,
                         message: format!("`{name}` is already defined in this scope"),
                     });
                 }
@@ -197,14 +195,14 @@ impl Analyzer {
             Stmt::Assign { name, value, line } => {
                 let Some(var_ty) = self.symbols.lookup(name) else {
                     return Err(SemaError {
-                        line: *line,
+                        span: Span::line_only(*line),
                         message: format!("assignment to undefined variable `{name}`"),
                     });
                 };
                 let val_ty = self.check_expr(value)?;
                 if val_ty != var_ty {
                     return Err(SemaError {
-                        line: *line,
+                        span: value.span,
                         message: format!(
                             "type mismatch: cannot assign {val_ty} to `{name}` of type {var_ty}"
                         ),
@@ -212,25 +210,25 @@ impl Analyzer {
                 }
                 Ok(())
             }
-            Stmt::IndexAssign { target, index, value, line } => {
+            Stmt::IndexAssign { target, index, value, line: _ } => {
                 let target_ty = self.check_expr(target)?;
                 let Type::Array(elem) = target_ty else {
                     return Err(SemaError {
-                        line: *line,
+                        span: target.span,
                         message: format!("cannot index-assign into a value of type {target_ty}"),
                     });
                 };
                 let idx_ty = self.check_expr(index)?;
                 if idx_ty != Type::Int {
                     return Err(SemaError {
-                        line: *line,
+                        span: index.span,
                         message: format!("array index must be int, found {idx_ty}"),
                     });
                 }
                 let val_ty = self.check_expr(value)?;
                 if val_ty != elem.to_type() {
                     return Err(SemaError {
-                        line: *line,
+                        span: value.span,
                         message: format!(
                             "type mismatch: cannot store {val_ty} in an array of {}",
                             elem.to_type()
@@ -250,7 +248,7 @@ impl Analyzer {
                 };
                 if ty != self.current_ret {
                     return Err(SemaError {
-                        line: *line,
+                        span: value.as_ref().map(|e| e.span).unwrap_or(Span::line_only(*line)),
                         message: format!(
                             "return type mismatch: function returns {} but got {ty}",
                             self.current_ret
@@ -263,7 +261,7 @@ impl Analyzer {
                 let cond_ty = self.check_expr(cond)?;
                 if cond_ty != Type::Bool {
                     return Err(SemaError {
-                        line: cond.line,
+                        span: cond.span,
                         message: format!("if condition must be bool, found {cond_ty}"),
                     });
                 }
@@ -277,7 +275,7 @@ impl Analyzer {
                 let cond_ty = self.check_expr(cond)?;
                 if cond_ty != Type::Bool {
                     return Err(SemaError {
-                        line: cond.line,
+                        span: cond.span,
                         message: format!("while condition must be bool, found {cond_ty}"),
                     });
                 }
@@ -286,12 +284,12 @@ impl Analyzer {
                 self.loop_depth -= 1;
                 Ok(())
             }
-            Stmt::For { var, start, end, body, line } => {
+            Stmt::For { var, start, end, body, line: _ } => {
                 for (label, e) in [("start", &mut *start), ("end", &mut *end)] {
                     let t = self.check_expr(e)?;
                     if t != Type::Int {
                         return Err(SemaError {
-                            line: *line,
+                            span: e.span,
                             message: format!("range {label} must be int, found {t}"),
                         });
                     }
@@ -305,11 +303,11 @@ impl Analyzer {
                 self.symbols.pop();
                 Ok(())
             }
-            Stmt::ForEach { var, iterable, body, line } => {
+            Stmt::ForEach { var, iterable, body, line: _ } => {
                 let t = self.check_expr(iterable)?;
                 let Type::Array(elem) = t else {
                     return Err(SemaError {
-                        line: *line,
+                        span: iterable.span,
                         message: format!("for-in iterates over an array, found {t}"),
                     });
                 };
@@ -324,7 +322,7 @@ impl Analyzer {
             Stmt::Break { line } | Stmt::Continue { line } => {
                 if self.loop_depth == 0 {
                     return Err(SemaError {
-                        line: *line,
+                        span: Span::line_only(*line),
                         message: "`break`/`continue` outside of a loop".into(),
                     });
                 }
@@ -341,36 +339,36 @@ impl Analyzer {
             ExprKind::Bool(_) => Type::Bool,
             ExprKind::Str(_) => Type::Str,
             ExprKind::Var(name) => self.symbols.lookup(name).ok_or_else(|| SemaError {
-                line: expr.line,
+                span: expr.span,
                 message: format!("undefined variable `{name}`"),
             })?,
             ExprKind::Unary(op, operand) => {
-                let line = expr.line;
+                let span = expr.span;
                 let t = self.check_expr(operand)?;
                 match op {
                     UnOp::Neg if t == Type::Int || t == Type::Float => t,
                     UnOp::Neg => {
                         return Err(SemaError {
-                            line,
+                            span,
                             message: format!("cannot negate a value of type {t}"),
                         });
                     }
                     UnOp::Not if t == Type::Bool => Type::Bool,
                     UnOp::Not => {
                         return Err(SemaError {
-                            line,
+                            span,
                             message: format!("`not` requires bool, found {t}"),
                         });
                     }
                 }
             }
             ExprKind::Binary(lhs, op, rhs) => {
-                let line = expr.line;
+                let span = expr.span;
                 let lt = self.check_expr(lhs)?;
                 let rt = self.check_expr(rhs)?;
                 if lt != rt {
                     return Err(SemaError {
-                        line,
+                        span,
                         message: format!("operand type mismatch: {lt} vs {rt}"),
                     });
                 }
@@ -381,7 +379,7 @@ impl Analyzer {
                             lt
                         } else {
                             return Err(SemaError {
-                                line,
+                                span,
                                 message: format!("arithmetic requires int or float, found {lt}"),
                             });
                         }
@@ -389,7 +387,7 @@ impl Analyzer {
                     BinOp::Eq | BinOp::Ne => {
                         if lt == Type::Unit || matches!(lt, Type::Array(_)) {
                             return Err(SemaError {
-                                line,
+                                span,
                                 message: format!("cannot compare values of type {lt}"),
                             });
                         }
@@ -400,7 +398,7 @@ impl Analyzer {
                             Type::Bool
                         } else {
                             return Err(SemaError {
-                                line,
+                                span,
                                 message: format!("ordering comparison requires int or float, found {lt}"),
                             });
                         }
@@ -410,7 +408,7 @@ impl Analyzer {
                             Type::Bool
                         } else {
                             return Err(SemaError {
-                                line,
+                                span,
                                 message: format!("`and`/`or` require bool, found {lt}"),
                             });
                         }
@@ -418,19 +416,19 @@ impl Analyzer {
                 }
             }
             ExprKind::Call(name, args) => {
-                let line = expr.line;
+                let span = expr.span;
                 // `print` is a compiler builtin, polymorphic over printable types.
                 if name == "print" {
                     if args.len() != 1 {
                         return Err(SemaError {
-                            line,
+                            span,
                             message: format!("print takes exactly 1 argument, got {}", args.len()),
                         });
                     }
                     let t = self.check_expr(&mut args[0])?;
                     if t == Type::Unit || matches!(t, Type::Array(_)) {
                         return Err(SemaError {
-                            line,
+                            span,
                             message: format!("cannot print a value of type {t}"),
                         });
                     }
@@ -438,14 +436,14 @@ impl Analyzer {
                 } else if name == "len" {
                     if args.len() != 1 {
                         return Err(SemaError {
-                            line,
+                            span,
                             message: format!("len takes exactly 1 argument, got {}", args.len()),
                         });
                     }
                     let t = self.check_expr(&mut args[0])?;
                     if t != Type::Str && !matches!(t, Type::Array(_)) {
                         return Err(SemaError {
-                            line,
+                            span,
                             message: format!("len requires a str or array, found {t}"),
                         });
                     }
@@ -453,21 +451,21 @@ impl Analyzer {
                 } else if name == "push" {
                     if args.len() != 2 {
                         return Err(SemaError {
-                            line,
+                            span,
                             message: format!("push takes exactly 2 arguments, got {}", args.len()),
                         });
                     }
                     let arr_ty = self.check_expr(&mut args[0])?;
                     let Type::Array(elem) = arr_ty else {
                         return Err(SemaError {
-                            line,
+                            span,
                             message: format!("push requires an array, found {arr_ty}"),
                         });
                     };
                     let val_ty = self.check_expr(&mut args[1])?;
                     if val_ty != elem.to_type() {
                         return Err(SemaError {
-                            line,
+                            span,
                             message: format!(
                                 "cannot push {val_ty} onto an array of {}",
                                 elem.to_type()
@@ -481,14 +479,14 @@ impl Analyzer {
                         .get(name)
                         .cloned()
                         .ok_or_else(|| SemaError {
-                            line,
+                            span,
                             message: format!("call to undefined function `{name}`"),
                         })?;
                     if args.len() < sig.params.len()
                         || (!sig.varargs && args.len() != sig.params.len())
                     {
                         return Err(SemaError {
-                            line,
+                            span,
                             message: format!(
                                 "`{name}` expects {}{} argument(s), got {}",
                                 if sig.varargs { "at least " } else { "" },
@@ -502,7 +500,7 @@ impl Analyzer {
                         if let Some(expected) = sig.params.get(i) {
                             if at != *expected {
                                 return Err(SemaError {
-                                    line,
+                                    span,
                                     message: format!(
                                         "argument {} of `{name}`: expected {expected}, found {at}",
                                         i + 1
@@ -511,7 +509,7 @@ impl Analyzer {
                             }
                         } else if at == Type::Unit {
                             return Err(SemaError {
-                                line,
+                                span,
                                 message: "cannot pass a unit value as a vararg".into(),
                             });
                         }
@@ -520,17 +518,17 @@ impl Analyzer {
                 }
             }
             ExprKind::ArrayLit(elems) => {
-                let line = expr.line;
+                let span = expr.span;
                 if elems.is_empty() {
                     return Err(SemaError {
-                        line,
+                        span,
                         message: "cannot infer the element type of `[]` here".into(),
                     });
                 }
                 let first = self.check_expr(&mut elems[0])?;
                 let Some(elem) = ElemType::from_type(first) else {
                     return Err(SemaError {
-                        line,
+                        span,
                         message: format!("arrays of {first} are not supported"),
                     });
                 };
@@ -538,7 +536,7 @@ impl Analyzer {
                     let t = self.check_expr(e)?;
                     if t != first {
                         return Err(SemaError {
-                            line: e.line,
+                            span: e.span,
                             message: format!(
                                 "array elements must all have the same type: expected {first}, found {t}"
                             ),
@@ -548,18 +546,18 @@ impl Analyzer {
                 Type::Array(elem)
             }
             ExprKind::Index(base, index) => {
-                let line = expr.line;
+                let span = expr.span;
                 let base_ty = self.check_expr(base)?;
                 let Type::Array(elem) = base_ty else {
                     return Err(SemaError {
-                        line,
+                        span,
                         message: format!("cannot index a value of type {base_ty}"),
                     });
                 };
                 let idx_ty = self.check_expr(index)?;
                 if idx_ty != Type::Int {
                     return Err(SemaError {
-                        line,
+                        span,
                         message: format!("array index must be int, found {idx_ty}"),
                     });
                 }

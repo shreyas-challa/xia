@@ -123,7 +123,7 @@ impl ArcInserter {
                     if is_heap {
                         // Bind the discarded value so it can be released.
                         let tmp = self.fresh_tmp();
-                        let line = e.line;
+                        let line = e.span.line;
                         out.push(Stmt::Let {
                             name: tmp.clone(),
                             ty: e.ty,
@@ -204,13 +204,14 @@ impl ArcInserter {
                 let is_heap = e.ty.map(Type::is_heap).unwrap_or(false);
                 let aliases = matches!(e.kind, ExprKind::Var(_));
                 let ty = e.ty;
+                let span = e.span;
                 let tmp = self.fresh_tmp();
                 out.push(Stmt::Let { name: tmp.clone(), ty, value: e, line });
                 if is_heap && aliases {
                     out.push(Stmt::Retain(tmp.clone()));
                 }
                 self.release_all(out);
-                let mut ret_expr = Expr::new(ExprKind::Var(tmp), line);
+                let mut ret_expr = Expr::new(ExprKind::Var(tmp), span);
                 ret_expr.ty = ty;
                 out.push(Stmt::Return { value: Some(ret_expr), line });
             }

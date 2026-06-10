@@ -24,18 +24,19 @@
 //! ```
 
 use crate::ast::*;
+use crate::diag::Span;
 use crate::lexer::{TokKind, Token};
 use std::fmt;
 
 #[derive(Debug, Clone)]
 pub struct ParseError {
-    pub line: usize,
+    pub span: Span,
     pub message: String,
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "parse error (line {}): {}", self.line, self.message)
+        write!(f, "parse error (line {}): {}", self.span.line, self.message)
     }
 }
 
@@ -57,8 +58,12 @@ impl Parser {
         &self.tokens[self.pos.min(self.tokens.len() - 1)].kind
     }
 
+    fn span(&self) -> Span {
+        self.tokens[self.pos.min(self.tokens.len() - 1)].span
+    }
+
     fn line(&self) -> usize {
-        self.tokens[self.pos.min(self.tokens.len() - 1)].line
+        self.span().line
     }
 
     fn advance(&mut self) -> TokKind {
@@ -88,7 +93,7 @@ impl Parser {
     }
 
     fn error(&self, message: String) -> ParseError {
-        ParseError { line: self.line(), message }
+        ParseError { span: self.span(), message }
     }
 
     fn expect_ident(&mut self) -> PResult<String> {
@@ -293,7 +298,7 @@ impl Parser {
                             line,
                         }),
                         _ => Err(ParseError {
-                            line,
+                            span: expr.span,
                             message: "invalid assignment target".into(),
                         }),
                     }
@@ -310,7 +315,8 @@ impl Parser {
     /// `for x in <array expr>:`. `range` is loop syntax, not a function —
     /// it never escapes a `for`.
     fn parse_for(&mut self) -> PResult<Stmt> {
-        let line = self.line();
+        let span = self.span();
+        let line = span.line;
         self.expect(TokKind::For)?;
         let var = self.expect_ident()?;
         self.expect(TokKind::In)?;
@@ -319,18 +325,19 @@ impl Parser {
         let body = self.parse_block()?;
         if let ExprKind::Call(name, _) = &iterable.kind {
             if name == "range" {
+                let range_span = iterable.span;
                 let ExprKind::Call(_, mut args) = iterable.kind else {
                     unreachable!();
                 };
                 let (start, end) = match args.len() {
-                    1 => (Expr::new(ExprKind::Int(0), line), args.pop().unwrap()),
+                    1 => (Expr::new(ExprKind::Int(0), range_span), args.pop().unwrap()),
                     2 => {
                         let end = args.pop().unwrap();
                         (args.pop().unwrap(), end)
                     }
                     n => {
                         return Err(ParseError {
-                            line,
+                            span: range_span,
                             message: format!("range takes 1 or 2 arguments, got {n}"),
                         });
                     }
@@ -385,12 +392,12 @@ impl Parser {
     fn parse_or(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_and()?;
         while self.peek() == &TokKind::Or {
-            let line = self.line();
+            let span = self.span();
             self.advance();
             let rhs = self.parse_and()?;
             lhs = Expr::new(
                 ExprKind::Binary(Box::new(lhs), BinOp::Or, Box::new(rhs)),
-                line,
+                span,
             );
         }
         Ok(lhs)
@@ -399,12 +406,12 @@ impl Parser {
     fn parse_and(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_not()?;
         while self.peek() == &TokKind::And {
-            let line = self.line();
+            let span = self.span();
             self.advance();
             let rhs = self.parse_not()?;
             lhs = Expr::new(
                 ExprKind::Binary(Box::new(lhs), BinOp::And, Box::new(rhs)),
-                line,
+                span,
             );
         }
         Ok(lhs)
@@ -412,10 +419,10 @@ impl Parser {
 
     fn parse_not(&mut self) -> PResult<Expr> {
         if self.peek() == &TokKind::Not {
-            let line = self.line();
+            let span = self.span();
             self.advance();
             let operand = self.parse_not()?;
-            Ok(Expr::new(ExprKind::Unary(UnOp::Not, Box::new(operand)), line))
+            Ok(Expr::new(ExprKind::Unary(UnOp::Not, Box::new(operand)), span))
         } else {
             self.parse_comparison()
         }
@@ -432,12 +439,12 @@ impl Parser {
             TokKind::Ge => BinOp::Ge,
             _ => return Ok(lhs),
         };
-        let line = self.line();
+        let span = self.span();
         self.advance();
         let rhs = self.parse_additive()?;
         Ok(Expr::new(
             ExprKind::Binary(Box::new(lhs), op, Box::new(rhs)),
-            line,
+            span,
         ))
     }
 
@@ -449,10 +456,10 @@ impl Parser {
                 TokKind::Minus => BinOp::Sub,
                 _ => break,
             };
-            let line = self.line();
+            let span = self.span();
             self.advance();
             let rhs = self.parse_term()?;
-            lhs = Expr::new(ExprKind::Binary(Box::new(lhs), op, Box::new(rhs)), line);
+            lhs = Expr::new(ExprKind::Binary(Box::new(lhs), op, Box::new(rhs)), span);
         }
         Ok(lhs)
     }
@@ -466,20 +473,20 @@ impl Parser {
                 TokKind::Percent => BinOp::Rem,
                 _ => break,
             };
-            let line = self.line();
+            let span = self.span();
             self.advance();
             let rhs = self.parse_unary()?;
-            lhs = Expr::new(ExprKind::Binary(Box::new(lhs), op, Box::new(rhs)), line);
+            lhs = Expr::new(ExprKind::Binary(Box::new(lhs), op, Box::new(rhs)), span);
         }
         Ok(lhs)
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
         if self.peek() == &TokKind::Minus {
-            let line = self.line();
+            let span = self.span();
             self.advance();
             let operand = self.parse_unary()?;
-            Ok(Expr::new(ExprKind::Unary(UnOp::Neg, Box::new(operand)), line))
+            Ok(Expr::new(ExprKind::Unary(UnOp::Neg, Box::new(operand)), span))
         } else {
             self.parse_primary()
         }
@@ -489,37 +496,37 @@ impl Parser {
     fn parse_primary(&mut self) -> PResult<Expr> {
         let mut expr = self.parse_atom()?;
         while self.peek() == &TokKind::LBracket {
-            let line = self.line();
+            let span = self.span();
             self.advance();
             let idx = self.parse_expression()?;
             self.expect(TokKind::RBracket)?;
-            expr = Expr::new(ExprKind::Index(Box::new(expr), Box::new(idx)), line);
+            expr = Expr::new(ExprKind::Index(Box::new(expr), Box::new(idx)), span);
         }
         Ok(expr)
     }
 
     fn parse_atom(&mut self) -> PResult<Expr> {
-        let line = self.line();
+        let span = self.span();
         match self.peek().clone() {
             TokKind::Int(n) => {
                 self.advance();
-                Ok(Expr::new(ExprKind::Int(n), line))
+                Ok(Expr::new(ExprKind::Int(n), span))
             }
             TokKind::Float(x) => {
                 self.advance();
-                Ok(Expr::new(ExprKind::Float(x), line))
+                Ok(Expr::new(ExprKind::Float(x), span))
             }
             TokKind::Str(s) => {
                 self.advance();
-                Ok(Expr::new(ExprKind::Str(s), line))
+                Ok(Expr::new(ExprKind::Str(s), span))
             }
             TokKind::True => {
                 self.advance();
-                Ok(Expr::new(ExprKind::Bool(true), line))
+                Ok(Expr::new(ExprKind::Bool(true), span))
             }
             TokKind::False => {
                 self.advance();
-                Ok(Expr::new(ExprKind::Bool(false), line))
+                Ok(Expr::new(ExprKind::Bool(false), span))
             }
             TokKind::LParen => {
                 self.advance();
@@ -537,7 +544,7 @@ impl Parser {
                         break;
                     }
                 }
-                Ok(Expr::new(ExprKind::ArrayLit(elems), line))
+                Ok(Expr::new(ExprKind::ArrayLit(elems), span))
             }
             TokKind::Ident(name) => {
                 self.advance();
@@ -550,9 +557,9 @@ impl Parser {
                             break;
                         }
                     }
-                    Ok(Expr::new(ExprKind::Call(name, args), line))
+                    Ok(Expr::new(ExprKind::Call(name, args), span))
                 } else {
-                    Ok(Expr::new(ExprKind::Var(name), line))
+                    Ok(Expr::new(ExprKind::Var(name), span))
                 }
             }
             other => Err(self.error(format!("unexpected {other} in expression"))),
@@ -560,7 +567,8 @@ impl Parser {
     }
 }
 
-/// Convenience: lex + parse a source string.
+/// Convenience for tests: lex + parse a source string.
+#[cfg(test)]
 pub fn parse(source: &str) -> Result<Program, Box<dyn std::error::Error>> {
     let tokens = crate::lexer::lex(source)?;
     let mut parser = Parser::new(tokens);
@@ -570,7 +578,6 @@ pub fn parse(source: &str) -> Result<Program, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::*;
 
     #[test]
     fn parses_simple_function() {

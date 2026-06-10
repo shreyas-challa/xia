@@ -5,6 +5,7 @@
 //! tokens Python-style. Newlines inside parentheses or brackets are joined
 //! implicitly.
 
+use crate::diag::Span;
 use logos::Logos;
 use std::fmt;
 
@@ -153,18 +154,18 @@ impl fmt::Display for TokKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     pub kind: TokKind,
-    pub line: usize,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
 pub struct LexError {
-    pub line: usize,
+    pub span: Span,
     pub message: String,
 }
 
 impl fmt::Display for LexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "lex error (line {}): {}", self.line, self.message)
+        write!(f, "lex error (line {}): {}", self.span.line, self.message)
     }
 }
 
@@ -187,7 +188,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
         if paren_depth == 0 {
             if trimmed.starts_with('\t') {
                 return Err(LexError {
-                    line: line_no,
+                    span: Span::new(line_no, raw_line.len() - trimmed.len() + 1, 1),
                     message: "tabs are not allowed in indentation; use spaces".into(),
                 });
             }
@@ -200,15 +201,21 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
             let current = *indents.last().unwrap();
             if indent > current {
                 indents.push(indent);
-                tokens.push(Token { kind: TokKind::Indent, line: line_no });
+                tokens.push(Token {
+                    kind: TokKind::Indent,
+                    span: Span::new(line_no, 1, indent),
+                });
             } else if indent < current {
                 while *indents.last().unwrap() > indent {
                     indents.pop();
-                    tokens.push(Token { kind: TokKind::Dedent, line: line_no });
+                    tokens.push(Token {
+                        kind: TokKind::Dedent,
+                        span: Span::new(line_no, 1, indent.max(1)),
+                    });
                 }
                 if *indents.last().unwrap() != indent {
                     return Err(LexError {
-                        line: line_no,
+                        span: Span::new(line_no, indent + 1, 1),
                         message: format!(
                             "unindent to column {indent} does not match any outer indentation level"
                         ),
@@ -220,6 +227,8 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
         let mut lexer = TokKind::lexer(raw_line);
         let mut emitted_any = false;
         while let Some(result) = lexer.next() {
+            let range = lexer.span();
+            let span = Span::new(line_no, range.start + 1, range.end - range.start);
             match result {
                 Ok(kind) => {
                     match kind {
@@ -229,12 +238,12 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
                         }
                         _ => {}
                     }
-                    tokens.push(Token { kind, line: line_no });
+                    tokens.push(Token { kind, span });
                     emitted_any = true;
                 }
                 Err(()) => {
                     return Err(LexError {
-                        line: line_no,
+                        span,
                         message: format!("unexpected character `{}`", lexer.slice()),
                     });
                 }
@@ -242,16 +251,25 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
         }
 
         if paren_depth == 0 && emitted_any {
-            tokens.push(Token { kind: TokKind::Newline, line: line_no });
+            tokens.push(Token {
+                kind: TokKind::Newline,
+                span: Span::new(line_no, raw_line.len() + 1, 1),
+            });
         }
     }
 
     let last_line = source.lines().count().max(1);
     while indents.len() > 1 {
         indents.pop();
-        tokens.push(Token { kind: TokKind::Dedent, line: last_line });
+        tokens.push(Token {
+            kind: TokKind::Dedent,
+            span: Span::line_only(last_line),
+        });
     }
-    tokens.push(Token { kind: TokKind::Eof, line: last_line });
+    tokens.push(Token {
+        kind: TokKind::Eof,
+        span: Span::line_only(last_line),
+    });
     Ok(tokens)
 }
 

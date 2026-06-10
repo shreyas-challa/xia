@@ -92,14 +92,14 @@ pub enum UnOp {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Expr {
     pub kind: ExprKind,
-    pub line: usize,
+    pub span: crate::diag::Span,
     /// Filled in by semantic analysis; `None` straight out of the parser.
     pub ty: Option<Type>,
 }
 
 impl Expr {
-    pub fn new(kind: ExprKind, line: usize) -> Self {
-        Expr { kind, line, ty: None }
+    pub fn new(kind: ExprKind, span: crate::diag::Span) -> Self {
+        Expr { kind, span, ty: None }
     }
 }
 

@@ -595,7 +595,7 @@ impl<'ctx> CodeGen<'ctx> {
     fn compile_expr_or_unit(&mut self, e: &Expr) -> CResult<Option<BasicValueEnum<'ctx>>> {
         match (&e.kind, e.ty) {
             (ExprKind::Call(name, args), Some(Type::Unit)) => {
-                self.compile_call(name, args, e.line)?;
+                self.compile_call(name, args, e.span.line)?;
                 Ok(None)
             }
             _ => Ok(Some(self.compile_expr(e)?)),
@@ -633,8 +633,8 @@ impl<'ctx> CodeGen<'ctx> {
             }
             ExprKind::Binary(lhs, op, rhs) => self.compile_binary(lhs, *op, rhs),
             ExprKind::Call(name, args) => {
-                self.compile_call(name, args, e.line)?
-                    .ok_or_else(|| format!("codegen: `{name}` returns no value (line {})", e.line))
+                self.compile_call(name, args, e.span.line)?
+                    .ok_or_else(|| format!("codegen: `{name}` returns no value (line {})", e.span.line))
             }
             ExprKind::ArrayLit(elems) => {
                 let Some(Type::Array(elem)) = e.ty else {

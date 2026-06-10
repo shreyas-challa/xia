@@ -174,4 +174,8 @@ fn check_rejects_bad_programs() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("return type mismatch"));
+    // Diagnostics point into the source with a caret underline.
+    assert!(stderr.contains("e2e_bad.xia:2:12"), "got: {stderr}");
+    assert!(stderr.contains("return \"oops\""), "got: {stderr}");
+    assert!(stderr.contains("^^^^^^"), "got: {stderr}");
 }
