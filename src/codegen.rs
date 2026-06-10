@@ -929,6 +929,63 @@ impl<'ctx> CodeGen<'ctx> {
         if name == "print" {
             return self.compile_print(&args[0]).map(|_| None);
         }
+        if name == "str" {
+            let arg = &args[0];
+            let v = self.compile_expr(arg)?;
+            let out = match arg.ty.unwrap() {
+                Type::Int => {
+                    let f = self.get_or_build_to_str(
+                        "xia_int_to_str",
+                        "%lld",
+                        self.context.i64_type().into(),
+                    )?;
+                    self.builder
+                        .build_call(f, &[v.into()], "str")
+                        .map_err(err)?
+                        .try_as_basic_value()
+                        .left()
+                        .unwrap()
+                        .into_pointer_value()
+                }
+                Type::Float => {
+                    let f = self.get_or_build_to_str(
+                        "xia_float_to_str",
+                        "%g",
+                        self.context.f64_type().into(),
+                    )?;
+                    self.builder
+                        .build_call(f, &[v.into()], "str")
+                        .map_err(err)?
+                        .try_as_basic_value()
+                        .left()
+                        .unwrap()
+                        .into_pointer_value()
+                }
+                Type::Bool => {
+                    // Immortal literals: retain/release are no-ops on them,
+                    // so the select result is safely treated as owned.
+                    let t = self.str_literal("true")?;
+                    let f = self.str_literal("false")?;
+                    self.builder
+                        .build_select(v.into_int_value(), t, f, "boolstr")
+                        .map_err(err)?
+                        .into_pointer_value()
+                }
+                Type::Str => {
+                    let dup = self.get_or_build_str_dup()?;
+                    self.builder
+                        .build_call(dup, &[v.into()], "str")
+                        .map_err(err)?
+                        .try_as_basic_value()
+                        .left()
+                        .unwrap()
+                        .into_pointer_value()
+                }
+                other => return Err(format!("codegen: str() of {other}")),
+            };
+            self.stmt_temps.push(out);
+            return Ok(Some(out.into()));
+        }
         if name == "len" {
             let arg = &args[0];
             let v = self.compile_expr(arg)?;
@@ -1515,6 +1572,63 @@ impl<'ctx> CodeGen<'ctx> {
         })
     }
 
+    /// Number-to-string via two-pass snprintf: measure, allocate, format.
+    fn get_or_build_to_str(
+        &mut self,
+        fn_name: &str,
+        fmt: &str,
+        param_ty: BasicMetadataTypeEnum<'ctx>,
+    ) -> CResult<FunctionValue<'ctx>> {
+        let i64_ty = self.context.i64_type();
+        let ptr_ty = self.ptr_ty();
+        let ty = ptr_ty.fn_type(&[param_ty], false);
+        let ctx = self.context;
+        let fmt_ptr = self.str_literal(fmt)?;
+        let snprintf_ty = self
+            .context
+            .i32_type()
+            .fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], true);
+        let (snp_ptr, snp_fnty) = self.libc("snprintf", snprintf_ty);
+        let alloc = self.get_or_build_alloc()?;
+        self.build_runtime_fn(fn_name, ty, |b, f| {
+            let v = f.get_nth_param(0).unwrap();
+            let entry = ctx.append_basic_block(f, "entry");
+            b.position_at_end(entry);
+            let len32 = b
+                .build_indirect_call(
+                    snp_fnty,
+                    snp_ptr,
+                    &[ptr_ty.const_null().into(), i64_ty.const_zero().into(), fmt_ptr.into(), v.into()],
+                    "len32",
+                )
+                .map_err(err)?
+                .try_as_basic_value()
+                .left()
+                .unwrap()
+                .into_int_value();
+            let len = b.build_int_s_extend(len32, i64_ty, "len").map_err(err)?;
+            let data = b
+                .build_call(alloc, &[len.into()], "data")
+                .map_err(err)?
+                .try_as_basic_value()
+                .left()
+                .unwrap()
+                .into_pointer_value();
+            let cap = b
+                .build_int_add(len, i64_ty.const_int(1, false), "cap")
+                .map_err(err)?;
+            b.build_indirect_call(
+                snp_fnty,
+                snp_ptr,
+                &[data.into(), cap.into(), fmt_ptr.into(), v.into()],
+                "",
+            )
+            .map_err(err)?;
+            b.build_return(Some(&data)).map_err(err)?;
+            Ok(())
+        })
+    }
+
     // ----- array runtime ----------------------------------------------------
 
     /// `xia_arr_new(kind, cap) -> ptr`: allocate the handle block and an
@@ -1990,6 +2104,16 @@ mod tests {
         let ir = compile_to_ir(src).unwrap();
         assert!(ir.contains("foreach.end"));
         assert!(ir.contains("call void @xia_release"));
+    }
+
+    #[test]
+    fn str_conversion_uses_snprintf() {
+        let src = "fn main():\n    print(f\"n = {7} x = {2.5}\")\n";
+        let ir = compile_to_ir(src).unwrap();
+        assert!(ir.contains("xia_int_to_str"));
+        assert!(ir.contains("xia_float_to_str"));
+        assert!(ir.contains("@snprintf"));
+        assert!(ir.contains("xia_str_concat"));
     }
 
     #[test]

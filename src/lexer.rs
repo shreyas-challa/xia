@@ -83,6 +83,9 @@ pub enum TokKind {
     Int(i64),
     #[regex(r#""([^"\\\n]|\\.)*""#, |lex| unescape(lex.slice()))]
     Str(String),
+    /// `f"..."` — an interpolated string; the parser splits `{expr}` parts.
+    #[regex(r#"f"([^"\\\n]|\\.)*""#, |lex| unescape(&lex.slice()[1..]))]
+    FStr(String),
     #[regex(r"[A-Za-z_][A-Za-z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
 
@@ -142,6 +145,7 @@ impl fmt::Display for TokKind {
             TokKind::Int(n) => write!(f, "integer `{n}`"),
             TokKind::Float(x) => write!(f, "float `{x}`"),
             TokKind::Str(_) => write!(f, "string literal"),
+            TokKind::FStr(_) => write!(f, "f-string literal"),
             TokKind::Newline => write!(f, "newline"),
             TokKind::Indent => write!(f, "indent"),
             TokKind::Dedent => write!(f, "dedent"),
@@ -375,6 +379,15 @@ mod tests {
                 Eof
             ]
         );
+    }
+
+    #[test]
+    fn fstring_token() {
+        let toks = kinds(r#"s = f"hi {name}!""#);
+        assert!(matches!(&toks[2], TokKind::FStr(s) if s == "hi {name}!"));
+        // a plain identifier starting with f still lexes as an identifier
+        let toks = kinds("flag = 1");
+        assert!(matches!(&toks[0], TokKind::Ident(s) if s == "flag"));
     }
 
     #[test]

@@ -433,6 +433,21 @@ impl Analyzer {
                         });
                     }
                     Type::Unit
+                } else if name == "str" {
+                    if args.len() != 1 {
+                        return Err(SemaError {
+                            span,
+                            message: format!("str takes exactly 1 argument, got {}", args.len()),
+                        });
+                    }
+                    let t = self.check_expr(&mut args[0])?;
+                    if t == Type::Unit || matches!(t, Type::Array(_)) {
+                        return Err(SemaError {
+                            span,
+                            message: format!("cannot convert a value of type {t} to str"),
+                        });
+                    }
+                    Type::Str
                 } else if name == "len" {
                     if args.len() != 1 {
                         return Err(SemaError {
@@ -701,6 +716,19 @@ mod tests {
         assert!(analyze("fn main():\n    let xs = [1]\n    xs[0] = 2\n").is_ok());
         assert!(analyze("fn main():\n    let xs = [1]\n    xs[0] = \"s\"\n").is_err());
         assert!(analyze("fn main():\n    let s = \"x\"\n    s[0] = \"y\"\n").is_err());
+    }
+
+    #[test]
+    fn str_builtin_and_fstrings_type_check() {
+        assert!(analyze("fn main():\n    print(str(42) + str(1.5) + str(true))\n").is_ok());
+        let prog = analyze("fn main():\n    let s = f\"n = {1 + 2}\"\n    print(s)\n").unwrap();
+        let Stmt::Let { ty, .. } = &prog.functions[0].body[0] else {
+            panic!()
+        };
+        assert_eq!(*ty, Some(Type::Str));
+        // arrays can't be converted/interpolated
+        assert!(analyze("fn main():\n    let xs = [1]\n    print(f\"{xs}\")\n").is_err());
+        assert!(analyze("fn f():\n    return\nfn main():\n    print(str(f()))\n").is_err());
     }
 
     #[test]

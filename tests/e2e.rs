@@ -124,6 +124,17 @@ fn main() -> int:
 }
 
 #[test]
+fn fstrings_interpolate_all_types() {
+    let src = "fn fib(n: int) -> int:\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\nfn main() -> int:\n    let name = \"world\"\n    print(f\"hello, {name}!\")\n    for i in range(3):\n        print(f\"fib({i}) = {fib(i)}\")\n    print(f\"pi ~ {3.14}, ok = {1 < 2}, {{braces}}\")\n    print(str(42) + \"!\")\n    return 0\n";
+    let (stdout, code) = compile_and_run("e2e_fstr", src, &["--release"]);
+    assert_eq!(
+        stdout,
+        "hello, world!\nfib(0) = 0\nfib(1) = 1\nfib(2) = 1\npi ~ 3.14, ok = true, {braces}\n42!\n"
+    );
+    assert_eq!(code, 0);
+}
+
+#[test]
 fn out_of_bounds_index_traps() {
     let src = "fn main() -> int:\n    let xs = [1, 2]\n    print(xs[5])\n    return 0\n";
     let (stdout, code) = compile_and_run("e2e_oob", src, &[]);

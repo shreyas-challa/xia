@@ -520,6 +520,10 @@ impl Parser {
                 self.advance();
                 Ok(Expr::new(ExprKind::Str(s), span))
             }
+            TokKind::FStr(s) => {
+                self.advance();
+                desugar_fstring(&s, span)
+            }
             TokKind::True => {
                 self.advance();
                 Ok(Expr::new(ExprKind::Bool(true), span))
@@ -564,6 +568,101 @@ impl Parser {
             }
             other => Err(self.error(format!("unexpected {other} in expression"))),
         }
+    }
+}
+
+/// Desugar `f"a {x} b"` into `"a " + str(x) + " b"`. `{{` / `}}` escape
+/// literal braces. Each `{...}` is re-lexed and parsed as an expression;
+/// quotes inside must be escaped (`\"`) because the f-string body ends at
+/// the first bare quote.
+fn desugar_fstring(s: &str, span: Span) -> PResult<Expr> {
+    let in_fstring = |message: String| ParseError {
+        span,
+        message: format!("in f-string: {message}"),
+    };
+    let mut parts: Vec<Expr> = Vec::new();
+    let mut lit = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+                lit.push('{');
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+                lit.push('}');
+            }
+            '{' => {
+                let mut inner = String::new();
+                loop {
+                    match chars.next() {
+                        Some('}') => break,
+                        Some(ch) => inner.push(ch),
+                        None => {
+                            return Err(in_fstring("unterminated `{`".into()));
+                        }
+                    }
+                }
+                if inner.trim().is_empty() {
+                    return Err(in_fstring("empty `{}` interpolation".into()));
+                }
+                if !lit.is_empty() {
+                    parts.push(Expr::new(ExprKind::Str(std::mem::take(&mut lit)), span));
+                }
+                let tokens =
+                    crate::lexer::lex(&inner).map_err(|e| in_fstring(e.message))?;
+                let mut sub = Parser::new(tokens);
+                let mut e = sub
+                    .parse_expression()
+                    .map_err(|e| in_fstring(e.message))?;
+                if !matches!(sub.peek(), TokKind::Newline | TokKind::Eof) {
+                    return Err(in_fstring(format!(
+                        "unexpected {} after expression",
+                        sub.peek()
+                    )));
+                }
+                // The snippet was lexed standalone; point its spans at the
+                // f-string token so later errors land on the right source.
+                respan(&mut e, span);
+                parts.push(Expr::new(ExprKind::Call("str".into(), vec![e]), span));
+            }
+            '}' => return Err(in_fstring("unmatched `}` (use `}}` for a literal)".into())),
+            other => lit.push(other),
+        }
+    }
+    if !lit.is_empty() || parts.is_empty() {
+        parts.push(Expr::new(ExprKind::Str(lit), span));
+    }
+    let mut iter = parts.into_iter();
+    let mut acc = iter.next().unwrap();
+    for p in iter {
+        acc = Expr::new(
+            ExprKind::Binary(Box::new(acc), BinOp::Add, Box::new(p)),
+            span,
+        );
+    }
+    Ok(acc)
+}
+
+fn respan(e: &mut Expr, span: Span) {
+    e.span = span;
+    match &mut e.kind {
+        ExprKind::Unary(_, a) => respan(a, span),
+        ExprKind::Binary(a, _, b) => {
+            respan(a, span);
+            respan(b, span);
+        }
+        ExprKind::Call(_, args) | ExprKind::ArrayLit(args) => {
+            for a in args {
+                respan(a, span);
+            }
+        }
+        ExprKind::Index(a, b) => {
+            respan(a, span);
+            respan(b, span);
+        }
+        _ => {}
     }
 }
 
@@ -697,6 +796,38 @@ mod tests {
     #[test]
     fn rejects_bad_assignment_target() {
         assert!(parse("fn f():\n    f() = 1\n").is_err());
+    }
+
+    #[test]
+    fn fstring_desugars_to_concat_with_str_calls() {
+        let src = "fn f(x: int):\n    let s = f\"a {x}!\"\n    print(s)\n";
+        let prog = parse(src).unwrap();
+        let Stmt::Let { value, .. } = &prog.functions[0].body[0] else {
+            panic!("expected let");
+        };
+        // ("a " + str(x)) + "!"
+        let ExprKind::Binary(lhs, BinOp::Add, rhs) = &value.kind else {
+            panic!("expected concat, got {:?}", value.kind);
+        };
+        assert!(matches!(&rhs.kind, ExprKind::Str(s) if s == "!"));
+        let ExprKind::Binary(a, BinOp::Add, b) = &lhs.kind else {
+            panic!("expected nested concat");
+        };
+        assert!(matches!(&a.kind, ExprKind::Str(s) if s == "a "));
+        assert!(matches!(&b.kind, ExprKind::Call(n, _) if n == "str"));
+    }
+
+    #[test]
+    fn fstring_brace_escapes_and_errors() {
+        let src = "fn f():\n    print(f\"{{x}}\")\n";
+        let prog = parse(src).unwrap();
+        let Stmt::Expr(e) = &prog.functions[0].body[0] else { panic!() };
+        let ExprKind::Call(_, args) = &e.kind else { panic!() };
+        assert!(matches!(&args[0].kind, ExprKind::Str(s) if s == "{x}"));
+
+        assert!(parse("fn f():\n    print(f\"{}\")\n").is_err());
+        assert!(parse("fn f():\n    print(f\"{x\")\n").is_err());
+        assert!(parse("fn f():\n    print(f\"x}\")\n").is_err());
     }
 
     #[test]
