@@ -162,6 +162,14 @@ pub enum Stmt {
         body: Block,
         line: usize,
     },
+    /// `for var in xs:` — iterates the elements of an array. `var` is a fresh
+    /// binding each iteration; heap elements arrive retained (+1).
+    ForEach {
+        var: String,
+        iterable: Expr,
+        body: Block,
+        line: usize,
+    },
     Break {
         line: usize,
     },

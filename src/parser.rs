@@ -8,7 +8,7 @@
 //! function   := "fn" IDENT "(" [params] ")" ["->" type] ":" block
 //! block      := NEWLINE INDENT statement+ DEDENT
 //! statement  := let | assign | if | while | for | return | break | continue | expr NEWLINE
-//! for        := "for" IDENT "in" "range" "(" expr ["," expr] ")" ":" block
+//! for        := "for" IDENT "in" ("range" "(" expr ["," expr] ")" | expr) ":" block
 //! expr       := or_expr
 //! or         := and ("or" and)*
 //! and        := not ("and" not)*
@@ -306,31 +306,39 @@ impl Parser {
         }
     }
 
-    /// `for i in range(end):` or `for i in range(start, end):`.
-    /// `range` is loop syntax, not a function — it never escapes a `for`.
+    /// `for i in range(end):`, `for i in range(start, end):`, or
+    /// `for x in <array expr>:`. `range` is loop syntax, not a function —
+    /// it never escapes a `for`.
     fn parse_for(&mut self) -> PResult<Stmt> {
         let line = self.line();
         self.expect(TokKind::For)?;
         let var = self.expect_ident()?;
         self.expect(TokKind::In)?;
-        let callee = self.expect_ident()?;
-        if callee != "range" {
-            return Err(self.error(format!(
-                "for loops iterate over `range(...)`, found `{callee}`"
-            )));
-        }
-        self.expect(TokKind::LParen)?;
-        let first = self.parse_expression()?;
-        let (start, end) = if self.check(&TokKind::Comma) {
-            let end = self.parse_expression()?;
-            (first, end)
-        } else {
-            (Expr::new(ExprKind::Int(0), line), first)
-        };
-        self.expect(TokKind::RParen)?;
+        let iterable = self.parse_expression()?;
         self.expect(TokKind::Colon)?;
         let body = self.parse_block()?;
-        Ok(Stmt::For { var, start, end, body, line })
+        if let ExprKind::Call(name, _) = &iterable.kind {
+            if name == "range" {
+                let ExprKind::Call(_, mut args) = iterable.kind else {
+                    unreachable!();
+                };
+                let (start, end) = match args.len() {
+                    1 => (Expr::new(ExprKind::Int(0), line), args.pop().unwrap()),
+                    2 => {
+                        let end = args.pop().unwrap();
+                        (args.pop().unwrap(), end)
+                    }
+                    n => {
+                        return Err(ParseError {
+                            line,
+                            message: format!("range takes 1 or 2 arguments, got {n}"),
+                        });
+                    }
+                };
+                return Ok(Stmt::For { var, start, end, body, line });
+            }
+        }
+        Ok(Stmt::ForEach { var, iterable, body, line })
     }
 
     /// `elif` chains desugar to nested if/else.
@@ -709,9 +717,19 @@ mod tests {
     }
 
     #[test]
-    fn for_requires_range() {
-        let src = "fn f():\n    for x in items:\n        print(x)\n";
-        assert!(parse(src).is_err());
+    fn for_over_array_parses_as_foreach() {
+        let src = "fn f(items: [str]):\n    for x in items:\n        print(x)\n";
+        let prog = parse(src).unwrap();
+        let Stmt::ForEach { var, iterable, .. } = &prog.functions[0].body[0] else {
+            panic!("expected foreach");
+        };
+        assert_eq!(var, "x");
+        assert!(matches!(&iterable.kind, ExprKind::Var(n) if n == "items"));
+    }
+
+    #[test]
+    fn range_arity_checked() {
+        assert!(parse("fn f():\n    for i in range(1, 2, 3):\n        print(i)\n").is_err());
     }
 
     #[test]

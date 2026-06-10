@@ -305,6 +305,22 @@ impl Analyzer {
                 self.symbols.pop();
                 Ok(())
             }
+            Stmt::ForEach { var, iterable, body, line } => {
+                let t = self.check_expr(iterable)?;
+                let Type::Array(elem) = t else {
+                    return Err(SemaError {
+                        line: *line,
+                        message: format!("for-in iterates over an array, found {t}"),
+                    });
+                };
+                self.symbols.push();
+                self.symbols.declare(var, elem.to_type());
+                self.loop_depth += 1;
+                self.check_block(body)?;
+                self.loop_depth -= 1;
+                self.symbols.pop();
+                Ok(())
+            }
             Stmt::Break { line } | Stmt::Continue { line } => {
                 if self.loop_depth == 0 {
                     return Err(SemaError {
@@ -623,6 +639,21 @@ mod tests {
     fn for_var_scoped_to_loop_and_allows_break() {
         assert!(analyze("fn main():\n    for i in range(3):\n        print(i)\n    print(i)\n").is_err());
         assert!(analyze("fn main():\n    for i in range(3):\n        break\n").is_ok());
+    }
+
+    #[test]
+    fn foreach_var_has_element_type() {
+        let prog = analyze(
+            "fn main():\n    let xs = [\"a\", \"b\"]\n    for s in xs:\n        print(s + \"!\")\n",
+        )
+        .unwrap();
+        let Stmt::ForEach { iterable, .. } = &prog.functions[0].body[1] else {
+            panic!()
+        };
+        assert_eq!(iterable.ty, Some(Type::Array(ElemType::Str)));
+        // iterating a non-array is rejected
+        assert!(analyze("fn main():\n    for x in 5:\n        print(x)\n").is_err());
+        assert!(analyze("fn main():\n    for c in \"abc\":\n        print(c)\n").is_err());
     }
 
     #[test]

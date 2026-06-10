@@ -91,7 +91,18 @@ impl ArcInserter {
     }
 
     fn process_block(&mut self, block: Block, kind: ScopeKind) -> Block {
-        self.scopes.push(Scope { kind, owned: Vec::new() });
+        self.process_block_owned(block, kind, Vec::new())
+    }
+
+    /// Like `process_block`, but the scope starts already owning `preowned`
+    /// (used for `for x in xs:` where each iteration's `x` arrives +1).
+    fn process_block_owned(
+        &mut self,
+        block: Block,
+        kind: ScopeKind,
+        preowned: Vec<String>,
+    ) -> Block {
+        self.scopes.push(Scope { kind, owned: preowned });
         let mut out: Vec<Stmt> = Vec::new();
 
         for stmt in block {
@@ -150,6 +161,17 @@ impl ArcInserter {
                     // body needs a loop scope for break/continue releases.
                     let body = self.process_block(body, ScopeKind::Loop);
                     out.push(Stmt::For { var, start, end, body, line });
+                }
+                Stmt::ForEach { var, iterable, body, line } => {
+                    // Heap elements arrive retained from the array, so each
+                    // iteration owns its `var` and must release it.
+                    let elem_heap = matches!(
+                        iterable.ty,
+                        Some(Type::Array(e)) if e.to_type().is_heap()
+                    );
+                    let preowned = if elem_heap { vec![var.clone()] } else { Vec::new() };
+                    let body = self.process_block_owned(body, ScopeKind::Loop, preowned);
+                    out.push(Stmt::ForEach { var, iterable, body, line });
                 }
                 other @ (Stmt::Assign { .. }
                 | Stmt::IndexAssign { .. }
@@ -252,9 +274,9 @@ mod tests {
                         count(b, retain, release);
                     }
                 }
-                Stmt::While { body, .. } | Stmt::For { body, .. } => {
-                    count(body, retain, release)
-                }
+                Stmt::While { body, .. }
+                | Stmt::For { body, .. }
+                | Stmt::ForEach { body, .. } => count(body, retain, release),
                 _ => {}
             }
         }
@@ -346,6 +368,25 @@ mod tests {
         let prog =
             lower("fn main():\n    let xs = [\"a\"]\n    let ys = xs\n    print(len(ys))\n");
         assert_eq!(balance(&prog), (1, 2), "alias retains; both bindings release");
+    }
+
+    #[test]
+    fn foreach_heap_var_released_each_iteration() {
+        let src = "fn main():\n    let xs = [\"a\"]\n    for s in xs:\n        print(s)\n";
+        let prog = lower(src);
+        let Stmt::ForEach { body, .. } = &prog.functions[0].body[1] else {
+            panic!("expected foreach");
+        };
+        assert!(
+            matches!(body.last().unwrap(), Stmt::Release(n) if n == "s"),
+            "iteration variable must be released at iteration end"
+        );
+        // int elements need no per-iteration release
+        let prog = lower("fn main():\n    let xs = [1]\n    for n in xs:\n        print(n)\n");
+        let Stmt::ForEach { body, .. } = &prog.functions[0].body[1] else {
+            panic!("expected foreach");
+        };
+        assert!(!matches!(body.last().unwrap(), Stmt::Release(_)));
     }
 
     #[test]

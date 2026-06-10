@@ -440,6 +440,109 @@ impl<'ctx> CodeGen<'ctx> {
                 self.builder.position_at_end(after_bb);
                 Ok(())
             }
+            Stmt::ForEach { var, iterable, body, .. } => {
+                let Some(Type::Array(elem)) = iterable.ty else {
+                    return Err("codegen: for-in over a non-array".into());
+                };
+                let function = self.current_function();
+                let i64_ty = self.context.i64_type();
+
+                // A fresh iterable (literal, call result) must stay alive for
+                // the whole loop; pull it out of the statement temps and
+                // release it after the loop instead.
+                let checkpoint = self.stmt_temps.len();
+                let arr = self.compile_expr(iterable)?.into_pointer_value();
+                let arr_is_temp = self.stmt_temps.last() == Some(&arr);
+                if arr_is_temp {
+                    self.consume_temp(arr);
+                }
+                self.flush_temps(checkpoint)?;
+
+                let idx_slot = self.builder.build_alloca(i64_ty, "foreach.idx").map_err(err)?;
+                self.builder.build_store(idx_slot, i64_ty.const_zero()).map_err(err)?;
+                let var_ty = elem.to_type();
+                let var_slot = self
+                    .builder
+                    .build_alloca(self.basic_type(var_ty), var)
+                    .map_err(err)?;
+                self.variables.push(HashMap::new());
+                self.variables
+                    .last_mut()
+                    .unwrap()
+                    .insert(var.clone(), (var_slot, var_ty));
+
+                let cond_bb = self.context.append_basic_block(function, "foreach.cond");
+                let body_bb = self.context.append_basic_block(function, "foreach.body");
+                let inc_bb = self.context.append_basic_block(function, "foreach.inc");
+                let after_bb = self.context.append_basic_block(function, "foreach.end");
+
+                self.builder.build_unconditional_branch(cond_bb).map_err(err)?;
+                self.builder.position_at_end(cond_bb);
+                let idx = self
+                    .builder
+                    .build_load(i64_ty, idx_slot, "idx")
+                    .map_err(err)?
+                    .into_int_value();
+                // Reload the length every iteration: the body may push.
+                let len = self
+                    .builder
+                    .build_load(i64_ty, arr, "len")
+                    .map_err(err)?
+                    .into_int_value();
+                let more = self
+                    .builder
+                    .build_int_compare(IntPredicate::SLT, idx, len, "foreach.lt")
+                    .map_err(err)?;
+                self.builder
+                    .build_conditional_branch(more, body_bb, after_bb)
+                    .map_err(err)?;
+
+                self.builder.position_at_end(body_bb);
+                let idx = self
+                    .builder
+                    .build_load(i64_ty, idx_slot, "idx")
+                    .map_err(err)?
+                    .into_int_value();
+                let get_fn = self.get_or_build_arr_get()?;
+                let raw = self
+                    .builder
+                    .build_call(get_fn, &[arr.into(), idx.into()], "elem")
+                    .map_err(err)?
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_int_value();
+                let v = self.from_word(raw, elem)?;
+                self.builder.build_store(var_slot, v).map_err(err)?;
+                // The ARC pass owns `var` in the loop scope and releases it
+                // at the end of each iteration (and on break/continue/return).
+                self.loop_stack.push((inc_bb, after_bb));
+                self.compile_block(body)?;
+                self.loop_stack.pop();
+                if !self.block_terminated() {
+                    self.builder.build_unconditional_branch(inc_bb).map_err(err)?;
+                }
+
+                self.builder.position_at_end(inc_bb);
+                let idx = self
+                    .builder
+                    .build_load(i64_ty, idx_slot, "idx")
+                    .map_err(err)?
+                    .into_int_value();
+                let next = self
+                    .builder
+                    .build_int_add(idx, i64_ty.const_int(1, false), "foreach.next")
+                    .map_err(err)?;
+                self.builder.build_store(idx_slot, next).map_err(err)?;
+                self.builder.build_unconditional_branch(cond_bb).map_err(err)?;
+
+                self.variables.pop();
+                self.builder.position_at_end(after_bb);
+                if arr_is_temp {
+                    self.emit_release(arr)?;
+                }
+                Ok(())
+            }
             Stmt::Break { .. } => {
                 let (_, after) = *self
                     .loop_stack
@@ -1870,6 +1973,23 @@ mod tests {
         // kind 2 = heap elements; release loops over them when the array dies
         assert!(ir.contains("@xia_arr_new(i64 2,"));
         assert!(ir.contains("elem.loop"));
+    }
+
+    #[test]
+    fn foreach_lowers_with_per_iteration_get() {
+        let src = "fn sum(xs: [int]) -> int:\n    let total = 0\n    for n in xs:\n        total = total + n\n    return total\n";
+        let ir = compile_to_ir(src).unwrap();
+        assert!(ir.contains("foreach.cond"));
+        assert!(ir.contains("foreach.inc"));
+        assert!(ir.contains("xia_arr_get"));
+    }
+
+    #[test]
+    fn foreach_over_fresh_literal_released_after_loop() {
+        let src = "fn main():\n    for s in [\"a\", \"b\"]:\n        print(s)\n";
+        let ir = compile_to_ir(src).unwrap();
+        assert!(ir.contains("foreach.end"));
+        assert!(ir.contains("call void @xia_release"));
     }
 
     #[test]
