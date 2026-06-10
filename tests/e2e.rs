@@ -96,6 +96,42 @@ fn for_range_with_break_and_continue() {
 }
 
 #[test]
+fn arrays_index_push_len_and_growth() {
+    let src = "fn main() -> int:\n    let xs = [10, 20, 30]\n    xs[1] = 21\n    for i in range(100):\n        push(xs, i)\n    print(len(xs))\n    print(xs[1])\n    print(xs[102])\n    let sum = 0\n    for n in [1, 2, 3, 4]:\n        sum = sum + n\n    print(sum)\n    return 0\n";
+    let (stdout, code) = compile_and_run("e2e_arrays", src, &[]);
+    assert_eq!(stdout, "103\n21\n99\n10\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn string_arrays_with_arc() {
+    let src = r#"fn names() -> [str]:
+    let xs = ["ada", "grace"]
+    push(xs, "alan" + " turing")
+    return xs
+
+fn main() -> int:
+    let xs = names()
+    xs[0] = xs[0] + "!"
+    for name in xs:
+        print(name)
+    print(len(xs))
+    return 0
+"#;
+    let (stdout, code) = compile_and_run("e2e_str_arrays", src, &["--release"]);
+    assert_eq!(stdout, "ada!\ngrace\nalan turing\n3\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn out_of_bounds_index_traps() {
+    let src = "fn main() -> int:\n    let xs = [1, 2]\n    print(xs[5])\n    return 0\n";
+    let (stdout, code) = compile_and_run("e2e_oob", src, &[]);
+    assert_eq!(code, 1, "bounds failure must exit(1)");
+    assert!(stdout.contains("out of bounds"), "got: {stdout}");
+}
+
+#[test]
 fn extern_ffi_calls_libc_directly() {
     let src = "extern fn printf(fmt: str, ...) -> int\nextern fn llabs(n: int) -> int\nfn main() -> int:\n    printf(\"%lld\\n\", llabs(0 - 9))\n    return 0\n";
     let (stdout, code) = compile_and_run("e2e_ffi", src, &[]);

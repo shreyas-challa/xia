@@ -1,0 +1,22 @@
+# Growable, reference-counted arrays with bounds-checked indexing.
+
+fn sum(xs: [int]) -> int:
+    let total = 0
+    for n in xs:
+        total = total + n
+    return total
+
+fn main() -> int:
+    let nums = [3, 1, 4, 1, 5]
+    push(nums, 9)
+    print(sum(nums))
+    print(len(nums))
+
+    # Arrays of strings are ARC-managed too — elements are retained by
+    # the array and released when it dies.
+    let langs = ["xia"]
+    push(langs, "c")
+    langs[1] = langs[1] + "!"
+    for name in langs:
+        print(name)
+    return 0
