@@ -10,7 +10,7 @@ jobs:
     name: Test (Linux, LLVM 18)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # llvm-sys needs llvm-config and the static libs; the Ubuntu 24.04
       # archive ships LLVM 18 directly.
