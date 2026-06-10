@@ -109,6 +109,15 @@ pub enum Stmt {
         cond: Expr,
         body: Block,
     },
+    /// `for var in range(start, end):` — counts from `start` (inclusive) to
+    /// `end` (exclusive). `continue` jumps to the increment, not the test.
+    For {
+        var: String,
+        start: Expr,
+        end: Expr,
+        body: Block,
+        line: usize,
+    },
     Break {
         line: usize,
     },

@@ -56,6 +56,10 @@ pub enum TokKind {
     Else,
     #[token("while")]
     While,
+    #[token("for")]
+    For,
+    #[token("in")]
+    In,
     #[token("break")]
     Break,
     #[token("continue")]
@@ -334,6 +338,25 @@ mod tests {
     fn string_escapes() {
         let toks = kinds(r#"s = "a\n\"b\"""#);
         assert!(matches!(&toks[2], TokKind::Str(s) if s == "a\n\"b\""));
+    }
+
+    #[test]
+    fn for_in_keywords() {
+        use TokKind::*;
+        assert_eq!(
+            kinds("for i in range(3)"),
+            vec![
+                For,
+                Ident("i".into()),
+                In,
+                Ident("range".into()),
+                LParen,
+                Int(3),
+                RParen,
+                Newline,
+                Eof
+            ]
+        );
     }
 
     #[test]

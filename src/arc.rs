@@ -145,6 +145,12 @@ impl ArcInserter {
                     let body = self.process_block(body, ScopeKind::Loop);
                     out.push(Stmt::While { cond, body });
                 }
+                Stmt::For { var, start, end, body, line } => {
+                    // The loop variable is an int — never heap — so only the
+                    // body needs a loop scope for break/continue releases.
+                    let body = self.process_block(body, ScopeKind::Loop);
+                    out.push(Stmt::For { var, start, end, body, line });
+                }
                 other @ (Stmt::Assign { .. } | Stmt::Retain(_) | Stmt::Release(_)) => {
                     out.push(other);
                 }
@@ -243,7 +249,9 @@ mod tests {
                         count(b, retain, release);
                     }
                 }
-                Stmt::While { body, .. } => count(body, retain, release),
+                Stmt::While { body, .. } | Stmt::For { body, .. } => {
+                    count(body, retain, release)
+                }
                 _ => {}
             }
         }

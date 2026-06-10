@@ -346,6 +346,69 @@ impl<'ctx> CodeGen<'ctx> {
                 self.builder.position_at_end(after_bb);
                 Ok(())
             }
+            Stmt::For { var, start, end, body, .. } => {
+                let function = self.current_function();
+                let i64_ty = self.context.i64_type();
+
+                // Bounds are evaluated once, before the loop.
+                let start_v = self.compile_expr(start)?.into_int_value();
+                let end_v = self.compile_expr(end)?.into_int_value();
+                self.flush_temps(0)?;
+
+                let slot = self.builder.build_alloca(i64_ty, var).map_err(err)?;
+                self.builder.build_store(slot, start_v).map_err(err)?;
+                self.variables.push(HashMap::new());
+                self.variables
+                    .last_mut()
+                    .unwrap()
+                    .insert(var.clone(), (slot, Type::Int));
+
+                let cond_bb = self.context.append_basic_block(function, "for.cond");
+                let body_bb = self.context.append_basic_block(function, "for.body");
+                let inc_bb = self.context.append_basic_block(function, "for.inc");
+                let after_bb = self.context.append_basic_block(function, "for.end");
+
+                self.builder.build_unconditional_branch(cond_bb).map_err(err)?;
+                self.builder.position_at_end(cond_bb);
+                let cur = self
+                    .builder
+                    .build_load(i64_ty, slot, var)
+                    .map_err(err)?
+                    .into_int_value();
+                let in_range = self
+                    .builder
+                    .build_int_compare(IntPredicate::SLT, cur, end_v, "for.lt")
+                    .map_err(err)?;
+                self.builder
+                    .build_conditional_branch(in_range, body_bb, after_bb)
+                    .map_err(err)?;
+
+                // `continue` must run the increment, so it targets inc_bb.
+                self.builder.position_at_end(body_bb);
+                self.loop_stack.push((inc_bb, after_bb));
+                self.compile_block(body)?;
+                self.loop_stack.pop();
+                if !self.block_terminated() {
+                    self.builder.build_unconditional_branch(inc_bb).map_err(err)?;
+                }
+
+                self.builder.position_at_end(inc_bb);
+                let cur = self
+                    .builder
+                    .build_load(i64_ty, slot, var)
+                    .map_err(err)?
+                    .into_int_value();
+                let next = self
+                    .builder
+                    .build_int_add(cur, i64_ty.const_int(1, false), "for.next")
+                    .map_err(err)?;
+                self.builder.build_store(slot, next).map_err(err)?;
+                self.builder.build_unconditional_branch(cond_bb).map_err(err)?;
+
+                self.variables.pop();
+                self.builder.position_at_end(after_bb);
+                Ok(())
+            }
             Stmt::Break { .. } => {
                 let (_, after) = *self
                     .loop_stack
@@ -1110,6 +1173,17 @@ mod tests {
         let ir = compile_to_ir(src).unwrap();
         assert!(ir.contains("loop.cond"));
         assert!(ir.contains("loop.end"));
+    }
+
+    #[test]
+    fn for_loop_has_increment_block() {
+        let src = "fn main() -> int:\n    let sum = 0\n    for i in range(1, 5):\n        if i == 3:\n            continue\n        sum = sum + i\n    return sum\n";
+        let ir = compile_to_ir(src).unwrap();
+        assert!(ir.contains("for.cond"));
+        assert!(ir.contains("for.inc"));
+        assert!(ir.contains("for.end"));
+        // `continue` must branch to the increment, never back to the test.
+        assert!(ir.contains("br label %for.inc"));
     }
 
     #[test]

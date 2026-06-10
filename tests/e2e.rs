@@ -88,6 +88,14 @@ fn main() -> int:
 }
 
 #[test]
+fn for_range_with_break_and_continue() {
+    let src = "fn main() -> int:\n    let sum = 0\n    for i in range(10):\n        if i == 2:\n            continue\n        if i == 5:\n            break\n        sum = sum + i\n    for j in range(3, 5):\n        print(j)\n    return sum\n";
+    let (stdout, code) = compile_and_run("e2e_for", src, &[]);
+    assert_eq!(stdout, "3\n4\n");
+    assert_eq!(code, 0 + 1 + 3 + 4);
+}
+
+#[test]
 fn extern_ffi_calls_libc_directly() {
     let src = "extern fn printf(fmt: str, ...) -> int\nextern fn llabs(n: int) -> int\nfn main() -> int:\n    printf(\"%lld\\n\", llabs(0 - 9))\n    return 0\n";
     let (stdout, code) = compile_and_run("e2e_ffi", src, &[]);

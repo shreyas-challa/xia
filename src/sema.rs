@@ -237,6 +237,25 @@ impl Analyzer {
                 self.loop_depth -= 1;
                 Ok(())
             }
+            Stmt::For { var, start, end, body, line } => {
+                for (label, e) in [("start", &mut *start), ("end", &mut *end)] {
+                    let t = self.check_expr(e)?;
+                    if t != Type::Int {
+                        return Err(SemaError {
+                            line: *line,
+                            message: format!("range {label} must be int, found {t}"),
+                        });
+                    }
+                }
+                // The loop variable lives in its own scope wrapping the body.
+                self.symbols.push();
+                self.symbols.declare(var, Type::Int);
+                self.loop_depth += 1;
+                self.check_block(body)?;
+                self.loop_depth -= 1;
+                self.symbols.pop();
+                Ok(())
+            }
             Stmt::Break { line } | Stmt::Continue { line } => {
                 if self.loop_depth == 0 {
                     return Err(SemaError {
@@ -457,6 +476,18 @@ mod tests {
         // wrong first arg type
         let bad = "extern fn printf(fmt: str, ...) -> int\nfn main() -> int:\n    printf(1)\n    return 0\n";
         assert!(analyze(bad).is_err());
+    }
+
+    #[test]
+    fn for_range_bounds_must_be_int() {
+        assert!(analyze("fn main():\n    for i in range(1.5):\n        print(i)\n").is_err());
+        assert!(analyze("fn main():\n    for i in range(0, true):\n        print(i)\n").is_err());
+    }
+
+    #[test]
+    fn for_var_scoped_to_loop_and_allows_break() {
+        assert!(analyze("fn main():\n    for i in range(3):\n        print(i)\n    print(i)\n").is_err());
+        assert!(analyze("fn main():\n    for i in range(3):\n        break\n").is_ok());
     }
 
     #[test]
