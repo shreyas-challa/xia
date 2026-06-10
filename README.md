@@ -6,7 +6,7 @@ garbage collector, and a zero-cost C FFI. The compiler is written in Rust and
 emits native machine code through LLVM 18.
 
 ```
-# Strings are heap-allocated and managed by ARC — no GC.
+# Strings and arrays are heap-allocated and managed by ARC — no GC.
 extern fn printf(fmt: str, ...) -> int
 
 fn greet(name: str) -> str:
@@ -19,7 +19,13 @@ fn fib(n: int) -> int:
 
 fn main() -> int:
     print(greet("world"))
-    printf("fib(10) = %lld\n", fib(10))
+    for i in range(11):
+        printf("fib(%lld) = %lld\n", i, fib(i))
+
+    let langs = ["xia", "c"]
+    push(langs, "rust")
+    for name in langs:
+        print(name)
     return 0
 ```
 
@@ -58,9 +64,16 @@ hello, world!
 ## Memory model
 
 - `int` (i64), `float` (f64), `bool` (i1) are plain values.
-- `str` is a refcounted heap block `[i64 refcount][bytes][NUL]`; the value
-  points at the bytes. A negative refcount marks immortal data (literals live
-  in constant globals and are never freed).
+- Every heap block starts with a `[i64 kind][i64 refcount]` header and the
+  value points just past it. A negative refcount marks immortal data
+  (string literals live in constant globals and are never freed).
+- `str` (kind 0) is `[header][bytes][NUL]`; the value points at the bytes,
+  so every Xia string doubles as a `char*` for the FFI.
+- `[T]` arrays (kind 1, or 2 for heap elements) are
+  `[header][len][cap][data ptr]` handles over a growable buffer of 8-byte
+  words. Indexing is bounds-checked (out of bounds prints a diagnostic and
+  exits with code 1). Arrays retain their heap elements; releasing the last
+  reference releases every element before freeing the buffer.
 - The compiler inserts all retain/release calls; there is nothing to call
   manually and no GC pause. Function arguments are borrowed, returns are +1,
   and `str` results from `extern` functions are copied into Xia-owned memory.
@@ -87,21 +100,36 @@ it:
 ```powershell
 $env:LLVM_SYS_181_PREFIX = "C:\path\to\llvm-18.1.8-windows-amd64-msvc17-msvcrt"
 cargo build --release
-cargo test        # 47 unit/IR tests + 7 end-to-end binary tests
+cargo test        # 71 unit/IR tests + 11 end-to-end binary tests
+```
+
+On Linux the distro packages work directly (see `.github/workflows/ci.yml`,
+which runs the suite on every push):
+
+```bash
+sudo apt-get install llvm-18-dev libpolly-18-dev libzstd-dev zlib1g-dev
+LLVM_SYS_181_PREFIX=/usr/lib/llvm-18 cargo test
 ```
 
 Linking on Windows uses `lld-link` from the same LLVM package against the
 MSVC / Windows SDK import libraries (Visual Studio Build Tools required); on
 Linux/macOS it uses the system `cc`.
 
-## Language reference (v0.1)
+## Language reference (v0.2)
 
-- Types: `int`, `float`, `bool`, `str`; functions may return nothing (unit).
+- Types: `int`, `float`, `bool`, `str`, `[T]` arrays; functions may return
+  nothing (unit). Nested arrays are not supported yet.
 - `let x = expr` (inferred) or `let x: type = expr`; assignment with `=`.
+  An empty array literal needs an annotation: `let xs: [int] = []`.
 - `if` / `elif` / `else`, `while`, `break`, `continue` — blocks by
   indentation, no braces.
+- `for i in range(end):` / `for i in range(start, end):` counts `start`
+  (inclusive) to `end` (exclusive); `for x in xs:` iterates an array's
+  elements. `continue` always advances the loop.
 - Operators: `+ - * / %`, comparisons, `and` / `or` / `not` (short-circuit);
-  `+` concatenates strings, `==`/`!=` compare them by value.
-- `print(x)` builtin for any printable type.
+  `+` concatenates strings, `==`/`!=` compare them by value. `xs[i]` indexes
+  (bounds-checked); `xs[i] = v` assigns in place.
+- Builtins: `print(x)` for any printable type; `len(s)` / `len(xs)`;
+  `push(xs, v)` appends (the buffer grows by doubling).
 - `extern fn name(types...) -> ret` declares a C symbol; `...` marks varargs
   (e.g. `printf`). Calls have zero wrapper overhead — they are direct calls.
