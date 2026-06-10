@@ -135,6 +135,22 @@ fn fstrings_interpolate_all_types() {
 }
 
 #[test]
+fn pop_find_and_string_indexing() {
+    let src = "fn main() -> int:\n    let s = \"hello world\"\n    print(s[0] + s[1])\n    print(find(s, \"world\"))\n    print(find(s, \"xyz\"))\n    let xs = [10, 20, 30]\n    let last = pop(xs)\n    print(f\"popped {last}, {len(xs)} left\")\n    let names = [\"a\", \"b\"]\n    print(pop(names) + \"!\")\n    return 0\n";
+    let (stdout, code) = compile_and_run("e2e_ops", src, &["--release"]);
+    assert_eq!(stdout, "he\n6\n-1\npopped 30, 2 left\nb!\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn pop_from_empty_array_traps() {
+    let src = "fn main() -> int:\n    let xs: [int] = []\n    print(pop(xs))\n    return 0\n";
+    let (stdout, code) = compile_and_run("e2e_pop_empty", src, &[]);
+    assert_eq!(code, 1);
+    assert!(stdout.contains("pop from an empty array"), "got: {stdout}");
+}
+
+#[test]
 fn out_of_bounds_index_traps() {
     let src = "fn main() -> int:\n    let xs = [1, 2]\n    print(xs[5])\n    return 0\n";
     let (stdout, code) = compile_and_run("e2e_oob", src, &[]);

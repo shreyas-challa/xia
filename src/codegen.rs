@@ -671,6 +671,21 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(arr.into())
             }
             ExprKind::Index(base, index) => {
+                if base.ty == Some(Type::Str) {
+                    let s = self.compile_expr(base)?.into_pointer_value();
+                    let idx = self.compile_expr(index)?.into_int_value();
+                    let f = self.get_or_build_str_index()?;
+                    let out = self
+                        .builder
+                        .build_call(f, &[s.into(), idx.into()], "char")
+                        .map_err(err)?
+                        .try_as_basic_value()
+                        .left()
+                        .unwrap()
+                        .into_pointer_value();
+                    self.stmt_temps.push(out);
+                    return Ok(out.into());
+                }
                 let Some(Type::Array(elem)) = base.ty else {
                     return Err("codegen: indexing a non-array".into());
                 };
@@ -1009,6 +1024,40 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 other => return Err(format!("codegen: len of {other}")),
             };
+            return Ok(Some(out));
+        }
+        if name == "pop" {
+            let Some(Type::Array(elem)) = args[0].ty else {
+                return Err("codegen: pop from a non-array".into());
+            };
+            let arr = self.compile_expr(&args[0])?.into_pointer_value();
+            let pop_fn = self.get_or_build_arr_pop()?;
+            let raw = self
+                .builder
+                .build_call(pop_fn, &[arr.into()], "popped")
+                .map_err(err)?
+                .try_as_basic_value()
+                .left()
+                .unwrap()
+                .into_int_value();
+            let v = self.from_word(raw, elem)?;
+            if elem.to_type().is_heap() {
+                // The array's reference transfers to the caller.
+                self.stmt_temps.push(v.into_pointer_value());
+            }
+            return Ok(Some(v));
+        }
+        if name == "find" {
+            let s = self.compile_expr(&args[0])?;
+            let sub = self.compile_expr(&args[1])?;
+            let find_fn = self.get_or_build_str_find()?;
+            let out = self
+                .builder
+                .build_call(find_fn, &[s.into(), sub.into()], "find")
+                .map_err(err)?
+                .try_as_basic_value()
+                .left()
+                .unwrap();
             return Ok(Some(out));
         }
         if name == "push" {
@@ -1780,6 +1829,164 @@ impl<'ctx> CodeGen<'ctx> {
         })
     }
 
+    /// `xia_arr_pop(arr) -> word`: remove and return the last element. The
+    /// array's reference to a heap element transfers to the caller (no
+    /// release). Popping an empty array exits with a diagnostic.
+    fn get_or_build_arr_pop(&mut self) -> CResult<FunctionValue<'ctx>> {
+        let i64_ty = self.context.i64_type();
+        let ptr_ty = self.ptr_ty();
+        let ty = i64_ty.fn_type(&[ptr_ty.into()], false);
+        let ctx = self.context;
+        let fmt = self.str_literal("xia: pop from an empty array\n")?;
+        let (printf_ptr, printf_fnty) = self.libc_printf();
+        let exit_ty = self
+            .context
+            .void_type()
+            .fn_type(&[self.context.i32_type().into()], false);
+        let (exit_ptr, exit_fnty) = self.libc("exit", exit_ty);
+        self.build_runtime_fn("xia_arr_pop", ty, |b, f| {
+            let arr = f.get_nth_param(0).unwrap().into_pointer_value();
+            let entry = ctx.append_basic_block(f, "entry");
+            let trap = ctx.append_basic_block(f, "trap");
+            let take = ctx.append_basic_block(f, "take");
+
+            b.position_at_end(entry);
+            let len = b.build_load(i64_ty, arr, "len").map_err(err)?.into_int_value();
+            let empty = b
+                .build_int_compare(IntPredicate::EQ, len, i64_ty.const_zero(), "empty")
+                .map_err(err)?;
+            b.build_conditional_branch(empty, trap, take).map_err(err)?;
+
+            b.position_at_end(trap);
+            b.build_indirect_call(printf_fnty, printf_ptr, &[fmt.into()], "")
+                .map_err(err)?;
+            b.build_indirect_call(
+                exit_fnty,
+                exit_ptr,
+                &[ctx.i32_type().const_int(1, false).into()],
+                "",
+            )
+            .map_err(err)?;
+            b.build_unreachable().map_err(err)?;
+
+            b.position_at_end(take);
+            let newlen = b
+                .build_int_sub(len, i64_ty.const_int(1, false), "newlen")
+                .map_err(err)?;
+            let data_slot = self.arr_field(b, arr, ARR_DATA_OFFSET, "data.slot")?;
+            let data = b
+                .build_load(ptr_ty, data_slot, "data")
+                .map_err(err)?
+                .into_pointer_value();
+            let slot = unsafe {
+                b.build_gep(i64_ty, data, &[newlen], "slot").map_err(err)?
+            };
+            let word = b.build_load(i64_ty, slot, "word").map_err(err)?.into_int_value();
+            b.build_store(arr, newlen).map_err(err)?;
+            b.build_return(Some(&word)).map_err(err)?;
+            Ok(())
+        })
+    }
+
+    /// `xia_str_index(s, i) -> ptr`: bounds-checked single-character string.
+    fn get_or_build_str_index(&mut self) -> CResult<FunctionValue<'ctx>> {
+        let i64_ty = self.context.i64_type();
+        let i8_ty = self.context.i8_type();
+        let ptr_ty = self.ptr_ty();
+        let ty = ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false);
+        let ctx = self.context;
+        let strlen_ty = i64_ty.fn_type(&[ptr_ty.into()], false);
+        let (strlen_ptr, strlen_fnty) = self.libc("strlen", strlen_ty);
+        let bounds_fail = self.get_or_build_bounds_fail()?;
+        let alloc = self.get_or_build_alloc()?;
+        self.build_runtime_fn("xia_str_index", ty, |b, f| {
+            let s = f.get_nth_param(0).unwrap().into_pointer_value();
+            let idx = f.get_nth_param(1).unwrap().into_int_value();
+            let entry = ctx.append_basic_block(f, "entry");
+            let trap = ctx.append_basic_block(f, "trap");
+            let take = ctx.append_basic_block(f, "take");
+
+            b.position_at_end(entry);
+            let len = b
+                .build_indirect_call(strlen_fnty, strlen_ptr, &[s.into()], "len")
+                .map_err(err)?
+                .try_as_basic_value()
+                .left()
+                .unwrap()
+                .into_int_value();
+            let ok = b
+                .build_int_compare(IntPredicate::ULT, idx, len, "ok")
+                .map_err(err)?;
+            b.build_conditional_branch(ok, take, trap).map_err(err)?;
+
+            b.position_at_end(trap);
+            b.build_call(bounds_fail, &[idx.into(), len.into()], "")
+                .map_err(err)?;
+            b.build_unreachable().map_err(err)?;
+
+            b.position_at_end(take);
+            let out = b
+                .build_call(alloc, &[i64_ty.const_int(1, false).into()], "out")
+                .map_err(err)?
+                .try_as_basic_value()
+                .left()
+                .unwrap()
+                .into_pointer_value();
+            let src = unsafe {
+                b.build_gep(i8_ty, s, &[idx], "src").map_err(err)?
+            };
+            let ch = b.build_load(i8_ty, src, "ch").map_err(err)?;
+            b.build_store(out, ch).map_err(err)?;
+            let nul = unsafe {
+                b.build_gep(i8_ty, out, &[i64_ty.const_int(1, false)], "nul")
+                    .map_err(err)?
+            };
+            b.build_store(nul, i8_ty.const_zero()).map_err(err)?;
+            b.build_return(Some(&out)).map_err(err)?;
+            Ok(())
+        })
+    }
+
+    /// `xia_str_find(s, sub) -> i64`: byte offset of the first occurrence of
+    /// `sub` in `s`, or -1. Lowers to libc `strstr`.
+    fn get_or_build_str_find(&mut self) -> CResult<FunctionValue<'ctx>> {
+        let i64_ty = self.context.i64_type();
+        let ptr_ty = self.ptr_ty();
+        let ty = i64_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
+        let ctx = self.context;
+        let strstr_ty = ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
+        let (strstr_ptr, strstr_fnty) = self.libc("strstr", strstr_ty);
+        self.build_runtime_fn("xia_str_find", ty, |b, f| {
+            let s = f.get_nth_param(0).unwrap().into_pointer_value();
+            let sub = f.get_nth_param(1).unwrap().into_pointer_value();
+            let entry = ctx.append_basic_block(f, "entry");
+            let missing = ctx.append_basic_block(f, "missing");
+            let found = ctx.append_basic_block(f, "found");
+
+            b.position_at_end(entry);
+            let hit = b
+                .build_indirect_call(strstr_fnty, strstr_ptr, &[s.into(), sub.into()], "hit")
+                .map_err(err)?
+                .try_as_basic_value()
+                .left()
+                .unwrap()
+                .into_pointer_value();
+            let is_null = b.build_is_null(hit, "is_null").map_err(err)?;
+            b.build_conditional_branch(is_null, missing, found).map_err(err)?;
+
+            b.position_at_end(missing);
+            b.build_return(Some(&i64_ty.const_int(u64::MAX, true)))
+                .map_err(err)?;
+
+            b.position_at_end(found);
+            let hit_i = b.build_ptr_to_int(hit, i64_ty, "hit.i").map_err(err)?;
+            let s_i = b.build_ptr_to_int(s, i64_ty, "s.i").map_err(err)?;
+            let off = b.build_int_sub(hit_i, s_i, "off").map_err(err)?;
+            b.build_return(Some(&off)).map_err(err)?;
+            Ok(())
+        })
+    }
+
     /// `xia_bounds_fail(idx, len)`: print a diagnostic and exit(1).
     fn get_or_build_bounds_fail(&mut self) -> CResult<FunctionValue<'ctx>> {
         let i64_ty = self.context.i64_type();
@@ -2104,6 +2311,16 @@ mod tests {
         let ir = compile_to_ir(src).unwrap();
         assert!(ir.contains("foreach.end"));
         assert!(ir.contains("call void @xia_release"));
+    }
+
+    #[test]
+    fn pop_find_and_str_index_lower_to_runtime() {
+        let src = "fn main() -> int:\n    let s = \"abc\"\n    print(s[1])\n    let xs = [1, 2]\n    return pop(xs) + find(s, \"c\")\n";
+        let ir = compile_to_ir(src).unwrap();
+        assert!(ir.contains("xia_str_index"));
+        assert!(ir.contains("xia_arr_pop"));
+        assert!(ir.contains("xia_str_find"));
+        assert!(ir.contains("@strstr"));
     }
 
     #[test]

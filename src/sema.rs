@@ -463,6 +463,38 @@ impl Analyzer {
                         });
                     }
                     Type::Int
+                } else if name == "pop" {
+                    if args.len() != 1 {
+                        return Err(SemaError {
+                            span,
+                            message: format!("pop takes exactly 1 argument, got {}", args.len()),
+                        });
+                    }
+                    let t = self.check_expr(&mut args[0])?;
+                    let Type::Array(elem) = t else {
+                        return Err(SemaError {
+                            span,
+                            message: format!("pop requires an array, found {t}"),
+                        });
+                    };
+                    elem.to_type()
+                } else if name == "find" {
+                    if args.len() != 2 {
+                        return Err(SemaError {
+                            span,
+                            message: format!("find takes exactly 2 arguments, got {}", args.len()),
+                        });
+                    }
+                    for arg in args.iter_mut() {
+                        let t = self.check_expr(arg)?;
+                        if t != Type::Str {
+                            return Err(SemaError {
+                                span: arg.span,
+                                message: format!("find requires str arguments, found {t}"),
+                            });
+                        }
+                    }
+                    Type::Int
                 } else if name == "push" {
                     if args.len() != 2 {
                         return Err(SemaError {
@@ -563,20 +595,25 @@ impl Analyzer {
             ExprKind::Index(base, index) => {
                 let span = expr.span;
                 let base_ty = self.check_expr(base)?;
-                let Type::Array(elem) = base_ty else {
-                    return Err(SemaError {
-                        span,
-                        message: format!("cannot index a value of type {base_ty}"),
-                    });
+                let elem_ty = match base_ty {
+                    Type::Array(elem) => elem.to_type(),
+                    // `s[i]` yields the character at byte i as a 1-char str.
+                    Type::Str => Type::Str,
+                    other => {
+                        return Err(SemaError {
+                            span,
+                            message: format!("cannot index a value of type {other}"),
+                        });
+                    }
                 };
                 let idx_ty = self.check_expr(index)?;
                 if idx_ty != Type::Int {
                     return Err(SemaError {
                         span,
-                        message: format!("array index must be int, found {idx_ty}"),
+                        message: format!("index must be int, found {idx_ty}"),
                     });
                 }
-                elem.to_type()
+                elem_ty
             }
         };
         expr.ty = Some(ty);
@@ -701,6 +738,21 @@ mod tests {
         assert!(analyze("fn main():\n    push(1, 2)\n").is_err());
         assert!(analyze("fn main():\n    print(len(\"abc\"))\n").is_ok());
         assert!(analyze("fn main():\n    print(len(5))\n").is_err());
+    }
+
+    #[test]
+    fn pop_find_and_string_indexing() {
+        let prog = analyze(
+            "fn main():\n    let s = \"abc\"\n    print(s[0])\n    print(find(s, \"b\"))\n    let xs = [1, 2]\n    print(pop(xs))\n",
+        )
+        .unwrap();
+        let Stmt::Expr(e) = &prog.functions[0].body[1] else { panic!() };
+        let ExprKind::Call(_, args) = &e.kind else { panic!() };
+        assert_eq!(args[0].ty, Some(Type::Str), "s[i] is a str");
+        // rejections
+        assert!(analyze("fn main():\n    print(pop(\"abc\"))\n").is_err());
+        assert!(analyze("fn main():\n    print(find(1, \"a\"))\n").is_err());
+        assert!(analyze("fn main():\n    let s = \"abc\"\n    s[0] = \"x\"\n").is_err());
     }
 
     #[test]
