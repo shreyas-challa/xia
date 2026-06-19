@@ -165,10 +165,11 @@ impl ArcInserter {
                 Stmt::ForEach { var, iterable, body, line } => {
                     // Heap elements arrive retained from the array, so each
                     // iteration owns its `var` and must release it.
-                    let elem_heap = matches!(
-                        iterable.ty,
-                        Some(Type::Array(e)) if e.to_type().is_heap()
-                    );
+                    let elem_heap = iterable
+                        .ty
+                        .and_then(Type::array_elem)
+                        .map(Type::is_heap)
+                        .unwrap_or(false);
                     let preowned = if elem_heap { vec![var.clone()] } else { Vec::new() };
                     let body = self.process_block_owned(body, ScopeKind::Loop, preowned);
                     out.push(Stmt::ForEach { var, iterable, body, line });

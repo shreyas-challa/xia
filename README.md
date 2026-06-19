@@ -121,8 +121,8 @@ Linux/macOS it uses the system `cc`.
 
 ## Language reference (v0.2)
 
-- Types: `int`, `float`, `bool`, `str`, `[T]` arrays, and `struct`s;
-  functions may return nothing (unit). Nested arrays are not supported yet.
+- Types: `int`, `float`, `bool`, `str`, `[T]` arrays (including nested
+  `[[T]]`), and `struct`s; functions may return nothing (unit).
 - `struct Name:` followed by an indented `field: type` per line declares a
   product type. Construct with positional arguments (`Name(a, b)`), read and
   assign fields with `.` (`p.x`, `p.x = 5`). Struct types resolve regardless
@@ -136,7 +136,8 @@ Linux/macOS it uses the system `cc`.
   elements. `continue` always advances the loop.
 - Operators: `+ - * / %`, comparisons, `and` / `or` / `not` (short-circuit);
   `+` concatenates strings, `==`/`!=` compare them by value. `xs[i]` indexes
-  (bounds-checked); `xs[i] = v` assigns in place.
+  (bounds-checked); `xs[i] = v` assigns in place. Indexing chains for nested
+  arrays: `grid[r][c]`, `grid[r][c] = v` (see `examples/matrix.xia`).
 - Builtins: `print(x)` for any printable type; `len(s)` / `len(xs)`;
   `push(xs, v)` appends (the buffer grows by doubling).
 - `extern fn name(types...) -> ret` declares a C symbol; `...` marks varargs

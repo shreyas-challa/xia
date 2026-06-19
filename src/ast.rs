@@ -3,8 +3,9 @@
 //! The parser produces this tree; semantic analysis annotates and rewrites it
 //! (notably inserting ARC retain/release), and codegen walks it.
 
-/// Element type of an array. A separate (smaller) enum keeps `Type` `Copy`;
-/// nested arrays are deferred until types grow a real arena/Box story.
+/// The scalar *base* of an array. Keeping it a small enum lets `Type` stay
+/// `Copy`; array nesting is encoded by a separate dimension count on
+/// `Type::Array`, so `[[int]]` is `Array(Int, 2)` rather than a recursive type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElemType {
     Int,
@@ -26,6 +27,7 @@ impl ElemType {
         }
     }
 
+    /// The base scalar of a non-array type. Returns `None` for arrays and unit.
     pub fn from_type(ty: Type) -> Option<ElemType> {
         match ty {
             Type::Int => Some(ElemType::Int),
@@ -33,7 +35,7 @@ impl ElemType {
             Type::Bool => Some(ElemType::Bool),
             Type::Str => Some(ElemType::Str),
             Type::Struct(id) => Some(ElemType::Struct(id)),
-            Type::Array(_) | Type::Unit => None,
+            Type::Array(..) | Type::Unit => None,
         }
     }
 }
@@ -44,8 +46,10 @@ pub enum Type {
     Float,
     Bool,
     Str,
-    /// `[T]` — a growable, reference-counted array.
-    Array(ElemType),
+    /// `[T]` — a growable, reference-counted array. The `u8` is the number of
+    /// nesting dimensions (≥ 1): `[int]` is `Array(Int, 1)`, `[[int]]` is
+    /// `Array(Int, 2)`. Indexing peels off one dimension.
+    Array(ElemType, u8),
     /// A user-defined struct, by interned id (index into `Program::structs`).
     Struct(u32),
     /// The "no value" type of statements and functions without `-> T`.
@@ -55,7 +59,27 @@ pub enum Type {
 impl Type {
     /// Heap-allocated, reference-counted types managed by ARC.
     pub fn is_heap(self) -> bool {
-        matches!(self, Type::Str | Type::Array(_) | Type::Struct(_))
+        matches!(self, Type::Str | Type::Array(..) | Type::Struct(_))
+    }
+
+    /// The element type produced by indexing an array once. `[[int]]` yields
+    /// `[int]`; `[int]` yields `int`. `None` for non-arrays.
+    pub fn array_elem(self) -> Option<Type> {
+        match self {
+            Type::Array(base, 1) => Some(base.to_type()),
+            Type::Array(base, dims) => Some(Type::Array(base, dims - 1)),
+            _ => None,
+        }
+    }
+
+    /// Build the type of an array whose elements have type `elem`. Stacking an
+    /// array on an array deepens the dimension count; `None` for `unit`.
+    pub fn array_of(elem: Type) -> Option<Type> {
+        match elem {
+            Type::Array(base, dims) => Some(Type::Array(base, dims + 1)),
+            Type::Unit => None,
+            scalar => Some(Type::Array(ElemType::from_type(scalar)?, 1)),
+        }
     }
 }
 
@@ -66,7 +90,16 @@ impl std::fmt::Display for Type {
             Type::Float => write!(f, "float"),
             Type::Bool => write!(f, "bool"),
             Type::Str => write!(f, "str"),
-            Type::Array(e) => write!(f, "[{}]", e.to_type()),
+            Type::Array(base, dims) => {
+                for _ in 0..*dims {
+                    write!(f, "[")?;
+                }
+                write!(f, "{}", base.to_type())?;
+                for _ in 0..*dims {
+                    write!(f, "]")?;
+                }
+                Ok(())
+            }
             Type::Struct(id) => write!(f, "struct#{id}"),
             Type::Unit => write!(f, "unit"),
         }

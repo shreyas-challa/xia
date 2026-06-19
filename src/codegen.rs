@@ -96,7 +96,7 @@ impl<'ctx> CodeGen<'ctx> {
             Type::Float => self.context.f64_type().into(),
             Type::Bool => self.context.bool_type().into(),
             Type::Str => self.context.ptr_type(AddressSpace::default()).into(),
-            Type::Array(_) => self.context.ptr_type(AddressSpace::default()).into(),
+            Type::Array(..) => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Struct(_) => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Unit => unreachable!("unit has no basic type"),
         }
@@ -289,7 +289,7 @@ impl<'ctx> CodeGen<'ctx> {
                 self.flush_temps(0)
             }
             Stmt::IndexAssign { target, index, value, .. } => {
-                let Some(Type::Array(elem)) = target.ty else {
+                let Some(elem) = target.ty.and_then(Type::array_elem) else {
                     return Err("codegen: index-assign target is not an array".into());
                 };
                 let arr = self.compile_expr(target)?.into_pointer_value();
@@ -470,7 +470,7 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(())
             }
             Stmt::ForEach { var, iterable, body, .. } => {
-                let Some(Type::Array(elem)) = iterable.ty else {
+                let Some(elem) = iterable.ty.and_then(Type::array_elem) else {
                     return Err("codegen: for-in over a non-array".into());
                 };
                 let function = self.current_function();
@@ -489,7 +489,7 @@ impl<'ctx> CodeGen<'ctx> {
 
                 let idx_slot = self.builder.build_alloca(i64_ty, "foreach.idx").map_err(err)?;
                 self.builder.build_store(idx_slot, i64_ty.const_zero()).map_err(err)?;
-                let var_ty = elem.to_type();
+                let var_ty = elem;
                 let var_slot = self
                     .builder
                     .build_alloca(self.basic_type(var_ty), var)
@@ -666,11 +666,11 @@ impl<'ctx> CodeGen<'ctx> {
                     .ok_or_else(|| format!("codegen: `{name}` returns no value (line {})", e.span.line))
             }
             ExprKind::ArrayLit(elems) => {
-                let Some(Type::Array(elem)) = e.ty else {
+                let Some(elem) = e.ty.and_then(Type::array_elem) else {
                     return Err("codegen: array literal without array type".into());
                 };
                 let i64_ty = self.context.i64_type();
-                let kind = if elem.to_type().is_heap() { KIND_ARR_HEAP } else { KIND_ARR };
+                let kind = if elem.is_heap() { KIND_ARR_HEAP } else { KIND_ARR };
                 let cap = (elems.len() as u64).max(4);
                 let new_fn = self.get_or_build_arr_new()?;
                 let arr = self
@@ -715,7 +715,7 @@ impl<'ctx> CodeGen<'ctx> {
                     self.stmt_temps.push(out);
                     return Ok(out.into());
                 }
-                let Some(Type::Array(elem)) = base.ty else {
+                let Some(elem) = base.ty.and_then(Type::array_elem) else {
                     return Err("codegen: indexing a non-array".into());
                 };
                 let arr = self.compile_expr(base)?.into_pointer_value();
@@ -730,7 +730,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .unwrap()
                     .into_int_value();
                 let v = self.from_word(raw, elem)?;
-                if elem.to_type().is_heap() {
+                if elem.is_heap() {
                     // xia_arr_get returns heap elements retained (+1).
                     self.stmt_temps.push(v.into_pointer_value());
                 }
@@ -784,28 +784,30 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
-    /// Pack a value into the 8-byte word stored in an array buffer.
+    /// Pack a value into the 8-byte word stored in an array buffer. Heap
+    /// element types (str, struct, nested array) are stored as pointers.
     fn to_word(
         &mut self,
         v: BasicValueEnum<'ctx>,
-        elem: ElemType,
+        elem: Type,
     ) -> CResult<inkwell::values::IntValue<'ctx>> {
         let i64_ty = self.context.i64_type();
         match elem {
-            ElemType::Int => Ok(v.into_int_value()),
-            ElemType::Float => Ok(self
+            Type::Int => Ok(v.into_int_value()),
+            Type::Float => Ok(self
                 .builder
                 .build_bit_cast(v.into_float_value(), i64_ty, "fbits")
                 .map_err(err)?
                 .into_int_value()),
-            ElemType::Bool => self
+            Type::Bool => self
                 .builder
                 .build_int_z_extend(v.into_int_value(), i64_ty, "bword")
                 .map_err(err),
-            ElemType::Str | ElemType::Struct(_) => self
+            Type::Str | Type::Struct(_) | Type::Array(..) => self
                 .builder
                 .build_ptr_to_int(v.into_pointer_value(), i64_ty, "pword")
                 .map_err(err),
+            Type::Unit => Err("codegen: cannot store a unit value in an array".into()),
         }
     }
 
@@ -813,24 +815,25 @@ impl<'ctx> CodeGen<'ctx> {
     fn from_word(
         &mut self,
         w: inkwell::values::IntValue<'ctx>,
-        elem: ElemType,
+        elem: Type,
     ) -> CResult<BasicValueEnum<'ctx>> {
         match elem {
-            ElemType::Int => Ok(w.into()),
-            ElemType::Float => Ok(self
+            Type::Int => Ok(w.into()),
+            Type::Float => Ok(self
                 .builder
                 .build_bit_cast(w, self.context.f64_type(), "fval")
                 .map_err(err)?),
-            ElemType::Bool => Ok(self
+            Type::Bool => Ok(self
                 .builder
                 .build_int_truncate(w, self.context.bool_type(), "bval")
                 .map_err(err)?
                 .into()),
-            ElemType::Str | ElemType::Struct(_) => Ok(self
+            Type::Str | Type::Struct(_) | Type::Array(..) => Ok(self
                 .builder
                 .build_int_to_ptr(w, self.ptr_ty(), "pval")
                 .map_err(err)?
                 .into()),
+            Type::Unit => Err("codegen: cannot load a unit value from an array".into()),
         }
     }
 
@@ -1090,7 +1093,7 @@ impl<'ctx> CodeGen<'ctx> {
                         .left()
                         .unwrap()
                 }
-                Type::Array(_) => {
+                Type::Array(..) => {
                     // The array value points directly at its length field.
                     self.builder
                         .build_load(self.context.i64_type(), v.into_pointer_value(), "len")
@@ -1101,7 +1104,7 @@ impl<'ctx> CodeGen<'ctx> {
             return Ok(Some(out));
         }
         if name == "pop" {
-            let Some(Type::Array(elem)) = args[0].ty else {
+            let Some(elem) = args[0].ty.and_then(Type::array_elem) else {
                 return Err("codegen: pop from a non-array".into());
             };
             let arr = self.compile_expr(&args[0])?.into_pointer_value();
@@ -1115,7 +1118,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .unwrap()
                 .into_int_value();
             let v = self.from_word(raw, elem)?;
-            if elem.to_type().is_heap() {
+            if elem.is_heap() {
                 // The array's reference transfers to the caller.
                 self.stmt_temps.push(v.into_pointer_value());
             }
@@ -1135,7 +1138,7 @@ impl<'ctx> CodeGen<'ctx> {
             return Ok(Some(out));
         }
         if name == "push" {
-            let Some(Type::Array(elem)) = args[0].ty else {
+            let Some(elem) = args[0].ty.and_then(Type::array_elem) else {
                 return Err("codegen: push to a non-array".into());
             };
             let arr = self.compile_expr(&args[0])?.into_pointer_value();
@@ -1298,7 +1301,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(err)?;
                 ("%s\n", sel.into())
             }
-            Type::Array(_) | Type::Struct(_) | Type::Unit => {
+            Type::Array(..) | Type::Struct(_) | Type::Unit => {
                 return Err("codegen: cannot print this type".into());
             }
         };
@@ -2476,6 +2479,19 @@ mod tests {
         // kind 2 = heap elements; release loops over them when the array dies
         assert!(ir.contains("@xia_arr_new(i64 2,"));
         assert!(ir.contains("elem.loop"));
+    }
+
+    #[test]
+    fn nested_arrays_store_rows_as_heap_elements() {
+        // `[[int]]` — the rows are arrays (heap), so the outer array is kind 2
+        // and stores/loads each row as a pointer word.
+        let src = "fn main():\n    let g = [[1, 2], [3, 4]]\n    print(g[0][1])\n";
+        let ir = compile_to_ir(src).unwrap();
+        assert!(ir.contains("@xia_arr_new(i64 2,"), "outer array holds heap rows");
+        // both the inner and outer arrays are built, and rows are pushed
+        assert!(ir.contains("xia_arr_push"));
+        // chained indexing reads through two gets
+        assert!(ir.matches("xia_arr_get").count() >= 2);
     }
 
     #[test]

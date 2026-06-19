@@ -151,6 +151,43 @@ fn pop_from_empty_array_traps() {
 }
 
 #[test]
+fn nested_arrays_index_mutate_and_iterate() {
+    // `[[int]]` — an array of arrays. Exercises chained indexing, index-assign
+    // into a nested element, nested for-in, and ARC of the heap row elements
+    // under -O3.
+    let src = r#"fn row(a: int, b: int, c: int) -> [int]:
+    let r: [int] = []
+    push(r, a)
+    push(r, b)
+    push(r, c)
+    return r
+
+fn main() -> int:
+    let grid: [[int]] = []
+    push(grid, row(1, 2, 3))
+    push(grid, row(4, 5, 6))
+    push(grid, row(7, 8, 9))
+    let i = 0
+    let trace = 0
+    for r in grid:
+        trace = trace + r[i]
+        i = i + 1
+    print(trace)
+    grid[1][2] = 60
+    print(grid[1][2])
+    for r in grid:
+        let s = 0
+        for x in r:
+            s = s + x
+        print(s)
+    return 0
+"#;
+    let (stdout, code) = compile_and_run("e2e_nested_arr", src, &["--release"]);
+    assert_eq!(stdout, "15\n60\n6\n69\n24\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
 fn structs_nested_heap_fields_and_arc() {
     // Nested structs, a heap (str) field, field reassignment (release old /
     // retain new), and structs stored in an array — all under -O3 so the ARC

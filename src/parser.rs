@@ -155,12 +155,10 @@ impl Parser {
         if self.check(&TokKind::LBracket) {
             let elem = self.parse_type()?;
             self.expect(TokKind::RBracket)?;
-            let Some(elem) = ElemType::from_type(elem) else {
-                return Err(self.error(format!(
-                    "`[{elem}]` is not a valid array type (nested arrays are not supported yet)"
-                )));
+            let Some(arr) = Type::array_of(elem) else {
+                return Err(self.error(format!("`[{elem}]` is not a valid array type")));
             };
-            return Ok(Type::Array(elem));
+            return Ok(arr);
         }
         let name = self.expect_ident()?;
         match name.as_str() {
@@ -837,7 +835,7 @@ mod tests {
         let Stmt::Let { ty, value, .. } = &prog.functions[0].body[0] else {
             panic!("expected let");
         };
-        assert_eq!(*ty, Some(Type::Array(ElemType::Int)));
+        assert_eq!(*ty, Some(Type::Array(ElemType::Int, 1)));
         let ExprKind::ArrayLit(elems) = &value.kind else {
             panic!("expected array literal");
         };
@@ -852,7 +850,7 @@ mod tests {
     fn parses_index_assignment() {
         let src = "fn f(xs: [str]):\n    xs[1] = \"two\"\n";
         let prog = parse(src).unwrap();
-        assert_eq!(prog.functions[0].params[0].ty, Type::Array(ElemType::Str));
+        assert_eq!(prog.functions[0].params[0].ty, Type::Array(ElemType::Str, 1));
         assert!(matches!(
             &prog.functions[0].body[0],
             Stmt::IndexAssign { .. }
@@ -860,8 +858,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_nested_array_type() {
-        assert!(parse("fn f(xs: [[int]]):\n    return\n").is_err());
+    fn parses_nested_array_type() {
+        let prog = parse("fn f(xs: [[int]]):\n    return\n").unwrap();
+        assert_eq!(prog.functions[0].params[0].ty, Type::Array(ElemType::Int, 2));
+        // a triple-nested type counts dimensions correctly
+        let prog = parse("fn g(g: [[[str]]]):\n    return\n").unwrap();
+        assert_eq!(prog.functions[0].params[0].ty, Type::Array(ElemType::Str, 3));
     }
 
     #[test]
