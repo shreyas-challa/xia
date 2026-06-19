@@ -151,6 +151,43 @@ fn pop_from_empty_array_traps() {
 }
 
 #[test]
+fn structs_nested_heap_fields_and_arc() {
+    // Nested structs, a heap (str) field, field reassignment (release old /
+    // retain new), and structs stored in an array — all under -O3 so the ARC
+    // pass has to keep everything balanced.
+    let src = r#"struct Point:
+    x: int
+    y: int
+
+struct Person:
+    name: str
+    home: Point
+    age: int
+
+fn birthday(p: Person) -> Person:
+    p.age = p.age + 1
+    return p
+
+fn main() -> int:
+    let home = Point(6, 4)
+    let p = birthday(Person("ada", home, 35))
+    print(f"{p.name} is {p.age}, at ({p.home.x}, {p.home.y})")
+    p.name = p.name + " lovelace"
+    print(p.name)
+    let crowd = [p, Person("grace", Point(1, 2), 40)]
+    for person in crowd:
+        print(person.name)
+    return 0
+"#;
+    let (stdout, code) = compile_and_run("e2e_structs", src, &["--release"]);
+    assert_eq!(
+        stdout,
+        "ada is 36, at (6, 4)\nada lovelace\nada lovelace\ngrace\n"
+    );
+    assert_eq!(code, 0);
+}
+
+#[test]
 fn out_of_bounds_index_traps() {
     let src = "fn main() -> int:\n    let xs = [1, 2]\n    print(xs[5])\n    return 0\n";
     let (stdout, code) = compile_and_run("e2e_oob", src, &[]);

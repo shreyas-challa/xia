@@ -26,6 +26,7 @@
 use crate::ast::*;
 use crate::diag::Span;
 use crate::lexer::{TokKind, Token};
+use std::collections::HashMap;
 use std::fmt;
 
 #[derive(Debug, Clone)]
@@ -45,13 +46,26 @@ impl std::error::Error for ParseError {}
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Struct name -> interned id, collected by a pre-scan so a struct can
+    /// be referenced before its declaration.
+    struct_ids: HashMap<String, u32>,
 }
 
 type PResult<T> = Result<T, ParseError>;
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0 }
+        let mut struct_ids = HashMap::new();
+        for pair in tokens.windows(2) {
+            if pair[0].kind == TokKind::Struct {
+                if let TokKind::Ident(name) = &pair[1].kind {
+                    if !struct_ids.contains_key(name) {
+                        struct_ids.insert(name.clone(), struct_ids.len() as u32);
+                    }
+                }
+            }
+        }
+        Parser { tokens, pos: 0, struct_ids }
     }
 
     fn peek(&self) -> &TokKind {
@@ -115,9 +129,21 @@ impl Parser {
                 TokKind::Eof => break,
                 TokKind::Extern => program.externs.push(self.parse_extern()?),
                 TokKind::Fn => program.functions.push(self.parse_function()?),
+                TokKind::Struct => {
+                    let def = self.parse_struct()?;
+                    if program.structs.iter().any(|s| s.name == def.name) {
+                        return Err(self.error(format!("duplicate struct `{}`", def.name)));
+                    }
+                    debug_assert_eq!(
+                        self.struct_ids[&def.name] as usize,
+                        program.structs.len(),
+                        "struct ids must match declaration order"
+                    );
+                    program.structs.push(def);
+                }
                 other => {
                     return Err(self.error(format!(
-                        "expected `fn` or `extern` at top level, found {other}"
+                        "expected `fn`, `struct` or `extern` at top level, found {other}"
                     )));
                 }
             }
@@ -142,8 +168,36 @@ impl Parser {
             "float" => Ok(Type::Float),
             "bool" => Ok(Type::Bool),
             "str" => Ok(Type::Str),
-            other => Err(self.error(format!("unknown type `{other}`"))),
+            other => match self.struct_ids.get(other) {
+                Some(id) => Ok(Type::Struct(*id)),
+                None => Err(self.error(format!("unknown type `{other}`"))),
+            },
         }
+    }
+
+    /// `struct Name:` NEWLINE INDENT (`field: type` NEWLINE)+ DEDENT
+    fn parse_struct(&mut self) -> PResult<StructDef> {
+        let line = self.line();
+        self.expect(TokKind::Struct)?;
+        let name = self.expect_ident()?;
+        self.expect(TokKind::Colon)?;
+        self.expect(TokKind::Newline)?;
+        self.expect(TokKind::Indent)?;
+        let mut fields: Vec<Param> = Vec::new();
+        while !self.check(&TokKind::Dedent) {
+            let fname = self.expect_ident()?;
+            if fields.iter().any(|f| f.name == fname) {
+                return Err(self.error(format!("duplicate field `{fname}` in `{name}`")));
+            }
+            self.expect(TokKind::Colon)?;
+            let ty = self.parse_type()?;
+            self.expect(TokKind::Newline)?;
+            fields.push(Param { name: fname, ty });
+        }
+        if fields.is_empty() {
+            return Err(self.error(format!("struct `{name}` must have at least one field")));
+        }
+        Ok(StructDef { name, fields, line })
     }
 
     fn parse_return_type(&mut self) -> PResult<Type> {
@@ -294,6 +348,12 @@ impl Parser {
                         ExprKind::Index(target, index) => Ok(Stmt::IndexAssign {
                             target: *target,
                             index: *index,
+                            value,
+                            line,
+                        }),
+                        ExprKind::Field(target, field) => Ok(Stmt::FieldAssign {
+                            target: *target,
+                            field,
                             value,
                             line,
                         }),
@@ -492,15 +552,25 @@ impl Parser {
         }
     }
 
-    /// An atom followed by any number of `[index]` suffixes.
+    /// An atom followed by any number of `[index]` / `.field` suffixes.
     fn parse_primary(&mut self) -> PResult<Expr> {
         let mut expr = self.parse_atom()?;
-        while self.peek() == &TokKind::LBracket {
+        loop {
             let span = self.span();
-            self.advance();
-            let idx = self.parse_expression()?;
-            self.expect(TokKind::RBracket)?;
-            expr = Expr::new(ExprKind::Index(Box::new(expr), Box::new(idx)), span);
+            match self.peek() {
+                TokKind::LBracket => {
+                    self.advance();
+                    let idx = self.parse_expression()?;
+                    self.expect(TokKind::RBracket)?;
+                    expr = Expr::new(ExprKind::Index(Box::new(expr), Box::new(idx)), span);
+                }
+                TokKind::Dot => {
+                    self.advance();
+                    let field = self.expect_ident()?;
+                    expr = Expr::new(ExprKind::Field(Box::new(expr), field), span);
+                }
+                _ => break,
+            }
         }
         Ok(expr)
     }
@@ -662,6 +732,7 @@ fn respan(e: &mut Expr, span: Span) {
             respan(a, span);
             respan(b, span);
         }
+        ExprKind::Field(a, _) => respan(a, span),
         _ => {}
     }
 }
@@ -828,6 +899,33 @@ mod tests {
         assert!(parse("fn f():\n    print(f\"{}\")\n").is_err());
         assert!(parse("fn f():\n    print(f\"{x\")\n").is_err());
         assert!(parse("fn f():\n    print(f\"x}\")\n").is_err());
+    }
+
+    #[test]
+    fn parses_struct_decl_and_field_access() {
+        let src = "struct Point:\n    x: int\n    y: int\nfn f(p: Point) -> int:\n    p.x = 5\n    return p.x + p.y\n";
+        let prog = parse(src).unwrap();
+        assert_eq!(prog.structs.len(), 1);
+        assert_eq!(prog.structs[0].name, "Point");
+        assert_eq!(prog.structs[0].fields.len(), 2);
+        assert_eq!(prog.functions[0].params[0].ty, Type::Struct(0));
+        assert!(matches!(
+            &prog.functions[0].body[0],
+            Stmt::FieldAssign { field, .. } if field == "x"
+        ));
+    }
+
+    #[test]
+    fn struct_types_resolve_in_any_order() {
+        let src = "fn f(p: Point) -> int:\n    return p.x\nstruct Point:\n    x: int\n";
+        assert!(parse(src).is_ok());
+    }
+
+    #[test]
+    fn struct_errors() {
+        assert!(parse("struct P:\n    x: int\n    x: int\n").is_err(), "dup field");
+        assert!(parse("struct P:\n    x: int\nstruct P:\n    y: int\n").is_err(), "dup struct");
+        assert!(parse("fn f(p: Nope) -> int:\n    return 0\n").is_err(), "unknown type");
     }
 
     #[test]

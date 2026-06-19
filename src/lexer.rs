@@ -45,6 +45,8 @@ pub enum TokKind {
     Fn,
     #[token("extern")]
     Extern,
+    #[token("struct")]
+    Struct,
     #[token("let")]
     Let,
     #[token("return")]
@@ -130,6 +132,8 @@ pub enum TokKind {
     RBracket,
     #[token("...")]
     Ellipsis,
+    #[token(".")]
+    Dot,
 
     // Structural tokens emitted by the indentation layer, never by logos.
     Newline,

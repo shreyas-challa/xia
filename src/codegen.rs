@@ -65,6 +65,9 @@ pub struct CodeGen<'ctx> {
     stmt_temps: Vec<PointerValue<'ctx>>,
     /// Interned string literal globals.
     str_literals: HashMap<String, PointerValue<'ctx>>,
+    /// Struct definitions and name lookup, copied from the program.
+    structs: Vec<StructDef>,
+    struct_ids: HashMap<String, u32>,
 }
 
 type CResult<T> = Result<T, String>;
@@ -82,6 +85,8 @@ impl<'ctx> CodeGen<'ctx> {
             sigs: HashMap::new(),
             stmt_temps: Vec::new(),
             str_literals: HashMap::new(),
+            structs: Vec::new(),
+            struct_ids: HashMap::new(),
         }
     }
 
@@ -92,6 +97,7 @@ impl<'ctx> CodeGen<'ctx> {
             Type::Bool => self.context.bool_type().into(),
             Type::Str => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Array(_) => self.context.ptr_type(AddressSpace::default()).into(),
+            Type::Struct(_) => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Unit => unreachable!("unit has no basic type"),
         }
     }
@@ -113,6 +119,10 @@ impl<'ctx> CodeGen<'ctx> {
     // ----- top level -------------------------------------------------------
 
     pub fn compile(&mut self, program: &Program) -> CResult<()> {
+        self.structs = program.structs.clone();
+        for (i, s) in self.structs.iter().enumerate() {
+            self.struct_ids.insert(s.name.clone(), i as u32);
+        }
         for e in &program.externs {
             self.sigs.insert(e.name.clone(), (true, e.ret));
             self.module
@@ -291,6 +301,25 @@ impl<'ctx> CodeGen<'ctx> {
                 self.builder
                     .build_call(set_fn, &[arr.into(), idx.into(), w.into()], "")
                     .map_err(err)?;
+                self.flush_temps(0)
+            }
+            Stmt::FieldAssign { target, field, value, .. } => {
+                let (p, _, idx, fty) = self.compile_field_slot(target, field)?;
+                let slot = self.field_ptr(p, idx)?;
+                let v = self.compile_expr(value)?;
+                if fty.is_heap() {
+                    // Retain the new value before releasing the old one so
+                    // `p.f = p.f` stays alive throughout.
+                    self.emit_retain(v.into_pointer_value())?;
+                    let old = self
+                        .builder
+                        .build_load(self.basic_type(fty), slot, "old")
+                        .map_err(err)?;
+                    self.builder.build_store(slot, v).map_err(err)?;
+                    self.emit_release(old.into_pointer_value())?;
+                } else {
+                    self.builder.build_store(slot, v).map_err(err)?;
+                }
                 self.flush_temps(0)
             }
             Stmt::Expr(e) => {
@@ -707,6 +736,51 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 Ok(v)
             }
+            ExprKind::Field(base, fname) => {
+                let (p, _, idx, fty) = self.compile_field_slot(base, fname)?;
+                let slot = self.field_ptr(p, idx)?;
+                let v = self
+                    .builder
+                    .build_load(self.basic_type(fty), slot, fname)
+                    .map_err(err)?;
+                if fty.is_heap() {
+                    // Reads hand out an owned reference, like xia_arr_get.
+                    self.emit_retain(v.into_pointer_value())?;
+                    self.stmt_temps.push(v.into_pointer_value());
+                }
+                Ok(v)
+            }
+        }
+    }
+
+    /// Compile a field-access base, resolving (base ptr, struct id, field
+    /// index, field type).
+    fn compile_field_slot(
+        &mut self,
+        base: &Expr,
+        fname: &str,
+    ) -> CResult<(PointerValue<'ctx>, u32, usize, Type)> {
+        let Some(Type::Struct(id)) = base.ty else {
+            return Err("codegen: field access on a non-struct".into());
+        };
+        let Some((idx, fty)) = self.structs[id as usize].field(fname) else {
+            return Err(format!("codegen: unknown field `{fname}`"));
+        };
+        let p = self.compile_expr(base)?.into_pointer_value();
+        Ok((p, id, idx, fty))
+    }
+
+    /// Pointer to field `idx` of a struct value (fields are 8-byte slots).
+    fn field_ptr(
+        &self,
+        p: PointerValue<'ctx>,
+        idx: usize,
+    ) -> CResult<PointerValue<'ctx>> {
+        let off = self.context.i64_type().const_int((idx * 8) as u64, false);
+        unsafe {
+            self.builder
+                .build_gep(self.context.i8_type(), p, &[off], "field.ptr")
+                .map_err(err)
         }
     }
 
@@ -728,7 +802,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .builder
                 .build_int_z_extend(v.into_int_value(), i64_ty, "bword")
                 .map_err(err),
-            ElemType::Str => self
+            ElemType::Str | ElemType::Struct(_) => self
                 .builder
                 .build_ptr_to_int(v.into_pointer_value(), i64_ty, "pword")
                 .map_err(err),
@@ -752,7 +826,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .build_int_truncate(w, self.context.bool_type(), "bval")
                 .map_err(err)?
                 .into()),
-            ElemType::Str => Ok(self
+            ElemType::Str | ElemType::Struct(_) => Ok(self
                 .builder
                 .build_int_to_ptr(w, self.ptr_ty(), "pval")
                 .map_err(err)?
@@ -1075,6 +1149,9 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(err)?;
             return Ok(None);
         }
+        if let Some(&id) = self.struct_ids.get(name) {
+            return self.compile_constructor(id, args).map(Some);
+        }
         let callee_name = if name == "main" { "xia_main" } else { name };
         let callee = self
             .module
@@ -1112,6 +1189,99 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(result)
     }
 
+    /// `Point(a, b)` — allocate `[kind][rc][fields...]`, retain heap fields.
+    /// The kind word is 0 for plain structs or the address of the generated
+    /// drop function when any field needs releasing.
+    fn compile_constructor(
+        &mut self,
+        id: u32,
+        args: &[Expr],
+    ) -> CResult<BasicValueEnum<'ctx>> {
+        let def = self.structs[id as usize].clone();
+        let i64_ty = self.context.i64_type();
+        let size = HEADER_SIZE as u64 + def.fields.len() as u64 * 8;
+        let malloc_ty = self.ptr_ty().fn_type(&[i64_ty.into()], false);
+        let (malloc_ptr, malloc_fnty) = self.libc("malloc", malloc_ty);
+        let block = self
+            .builder
+            .build_indirect_call(
+                malloc_fnty,
+                malloc_ptr,
+                &[i64_ty.const_int(size, false).into()],
+                "block",
+            )
+            .map_err(err)?
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_pointer_value();
+
+        let kind: inkwell::values::IntValue = if def.fields.iter().any(|f| f.ty.is_heap()) {
+            let drop_fn = self.get_or_build_struct_drop(id)?;
+            self.builder
+                .build_ptr_to_int(
+                    drop_fn.as_global_value().as_pointer_value(),
+                    i64_ty,
+                    "drop.addr",
+                )
+                .map_err(err)?
+        } else {
+            i64_ty.const_zero()
+        };
+        self.builder.build_store(block, kind).map_err(err)?;
+        let rc_slot = self.arr_field(&self.builder, block, RC_OFFSET as u64, "rc.slot")?;
+        self.builder
+            .build_store(rc_slot, i64_ty.const_int(1, false))
+            .map_err(err)?;
+        let val = self.arr_field(&self.builder, block, HEADER_SIZE as u64, "val")?;
+
+        for (i, (arg, field)) in args.iter().zip(&def.fields).enumerate() {
+            let v = self.compile_expr(arg)?;
+            if field.ty.is_heap() {
+                // The struct owns its own reference to each heap field.
+                self.emit_retain(v.into_pointer_value())?;
+            }
+            let slot = self.field_ptr(val, i)?;
+            self.builder.build_store(slot, v).map_err(err)?;
+        }
+        self.stmt_temps.push(val);
+        Ok(val.into())
+    }
+
+    /// `xia_drop_<Name>(p)`: release every heap-typed field. `xia_release`
+    /// calls this through the kind word before freeing the block.
+    fn get_or_build_struct_drop(&mut self, id: u32) -> CResult<FunctionValue<'ctx>> {
+        let def = self.structs[id as usize].clone();
+        let fn_name = format!("xia_drop_{}", def.name);
+        let ptr_ty = self.ptr_ty();
+        let ty = self.context.void_type().fn_type(&[ptr_ty.into()], false);
+        let ctx = self.context;
+        let i64_ty = self.context.i64_type();
+        let release = self.get_or_build_release()?;
+        self.build_runtime_fn(&fn_name, ty, |b, f| {
+            let p = f.get_nth_param(0).unwrap().into_pointer_value();
+            let entry = ctx.append_basic_block(f, "entry");
+            b.position_at_end(entry);
+            for (i, field) in def.fields.iter().enumerate() {
+                if !field.ty.is_heap() {
+                    continue;
+                }
+                let off = i64_ty.const_int((i * 8) as u64, false);
+                let slot = unsafe {
+                    b.build_gep(ctx.i8_type(), p, &[off], "field.ptr")
+                        .map_err(err)?
+                };
+                let v = b
+                    .build_load(ptr_ty, slot, "field")
+                    .map_err(err)?
+                    .into_pointer_value();
+                b.build_call(release, &[v.into()], "").map_err(err)?;
+            }
+            b.build_return(None).map_err(err)?;
+            Ok(())
+        })
+    }
+
     /// Compiler builtin: `print(x)` lowers to a libc `printf` call.
     fn compile_print(&mut self, arg: &Expr) -> CResult<()> {
         let v = self.compile_expr(arg)?;
@@ -1128,7 +1298,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(err)?;
                 ("%s\n", sel.into())
             }
-            Type::Array(_) | Type::Unit => {
+            Type::Array(_) | Type::Struct(_) | Type::Unit => {
                 return Err("codegen: cannot print this type".into());
             }
         };
@@ -1350,6 +1520,7 @@ impl<'ctx> CodeGen<'ctx> {
             let dec = ctx.append_basic_block(f, "dec");
             let dead = ctx.append_basic_block(f, "dead");
             let arr = ctx.append_basic_block(f, "arr");
+            let drop_call = ctx.append_basic_block(f, "drop.call");
             let elem_loop = ctx.append_basic_block(f, "elem.loop");
             let elem_body = ctx.append_basic_block(f, "elem.body");
             let free_data = ctx.append_basic_block(f, "free.data");
@@ -1378,20 +1549,31 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(err)?;
             b.build_conditional_branch(is_zero, dead, store).map_err(err)?;
 
-            // Dead value: arrays free their element buffer (releasing each
-            // element first if they are heap values); then the block goes.
+            // Dead value: dispatch on the kind word. 0 = plain block (str /
+            // field-free struct), 1/2 = array; anything else is the address
+            // of a struct drop function that releases the fields.
             b.position_at_end(dead);
             let block = self.block_ptr(b, p)?;
             let kind = b.build_load(i64_ty, block, "kind").map_err(err)?.into_int_value();
-            let is_arr = b
-                .build_int_compare(
-                    IntPredicate::NE,
-                    kind,
-                    i64_ty.const_int(KIND_STR, false),
-                    "is_arr",
-                )
+            b.build_switch(
+                kind,
+                drop_call,
+                &[
+                    (i64_ty.const_int(KIND_STR, false), free_block),
+                    (i64_ty.const_int(KIND_ARR, false), arr),
+                    (i64_ty.const_int(KIND_ARR_HEAP, false), arr),
+                ],
+            )
+            .map_err(err)?;
+
+            b.position_at_end(drop_call);
+            let drop_ty = ctx.void_type().fn_type(&[ptr_ty.into()], false);
+            let drop_ptr = b
+                .build_int_to_ptr(kind, ptr_ty, "drop.fn")
                 .map_err(err)?;
-            b.build_conditional_branch(is_arr, arr, free_block).map_err(err)?;
+            b.build_indirect_call(drop_ty, drop_ptr, &[p.into()], "")
+                .map_err(err)?;
+            b.build_unconditional_branch(free_block).map_err(err)?;
 
             b.position_at_end(arr);
             let len = b.build_load(i64_ty, p, "len").map_err(err)?.into_int_value();
@@ -2339,5 +2521,27 @@ mod tests {
         let ir = compile_to_ir(src).unwrap();
         assert!(ir.contains("fmul double"));
         assert!(ir.contains("fadd double"));
+    }
+
+    #[test]
+    fn struct_with_heap_field_emits_drop_function() {
+        // A struct holding a str needs a per-type destructor that releases the
+        // field; the constructor stores that drop fn's address in the kind word.
+        let src = "struct Person:\n    name: str\n    age: int\nfn main():\n    let p = Person(\"ada\", 36)\n    print(p.name)\n";
+        let ir = compile_to_ir(src).unwrap();
+        assert!(ir.contains("@xia_drop_Person"), "per-type drop fn is emitted");
+        // the drop fn releases the heap field
+        assert!(ir.contains("call void @xia_release"));
+        // release dispatches on the kind word via a switch (default -> drop call)
+        assert!(ir.contains("switch i64"));
+    }
+
+    #[test]
+    fn struct_without_heap_fields_uses_zero_kind() {
+        // A struct of only scalar fields needs no destructor; its kind word is 0
+        // and no drop fn is generated for it.
+        let src = "struct Point:\n    x: int\n    y: int\nfn main():\n    let p = Point(3, 4)\n    print(p.x + p.y)\n";
+        let ir = compile_to_ir(src).unwrap();
+        assert!(!ir.contains("@xia_drop_Point"), "no drop fn for scalar-only struct");
     }
 }

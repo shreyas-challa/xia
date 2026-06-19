@@ -11,6 +11,8 @@ pub enum ElemType {
     Float,
     Bool,
     Str,
+    /// Interned struct id — an index into `Program::structs`.
+    Struct(u32),
 }
 
 impl ElemType {
@@ -20,6 +22,7 @@ impl ElemType {
             ElemType::Float => Type::Float,
             ElemType::Bool => Type::Bool,
             ElemType::Str => Type::Str,
+            ElemType::Struct(id) => Type::Struct(id),
         }
     }
 
@@ -29,6 +32,7 @@ impl ElemType {
             Type::Float => Some(ElemType::Float),
             Type::Bool => Some(ElemType::Bool),
             Type::Str => Some(ElemType::Str),
+            Type::Struct(id) => Some(ElemType::Struct(id)),
             Type::Array(_) | Type::Unit => None,
         }
     }
@@ -42,6 +46,8 @@ pub enum Type {
     Str,
     /// `[T]` — a growable, reference-counted array.
     Array(ElemType),
+    /// A user-defined struct, by interned id (index into `Program::structs`).
+    Struct(u32),
     /// The "no value" type of statements and functions without `-> T`.
     Unit,
 }
@@ -49,7 +55,7 @@ pub enum Type {
 impl Type {
     /// Heap-allocated, reference-counted types managed by ARC.
     pub fn is_heap(self) -> bool {
-        matches!(self, Type::Str | Type::Array(_))
+        matches!(self, Type::Str | Type::Array(_) | Type::Struct(_))
     }
 }
 
@@ -61,6 +67,7 @@ impl std::fmt::Display for Type {
             Type::Bool => write!(f, "bool"),
             Type::Str => write!(f, "str"),
             Type::Array(e) => write!(f, "[{}]", e.to_type()),
+            Type::Struct(id) => write!(f, "struct#{id}"),
             Type::Unit => write!(f, "unit"),
         }
     }
@@ -117,6 +124,8 @@ pub enum ExprKind {
     ArrayLit(Vec<Expr>),
     /// `base[index]`
     Index(Box<Expr>, Box<Expr>),
+    /// `base.field`
+    Field(Box<Expr>, String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -136,6 +145,13 @@ pub enum Stmt {
     IndexAssign {
         target: Expr,
         index: Expr,
+        value: Expr,
+        line: usize,
+    },
+    /// `target.field = value`
+    FieldAssign {
+        target: Expr,
+        field: String,
         value: Expr,
         line: usize,
     },
@@ -209,8 +225,28 @@ pub struct ExternFn {
     pub line: usize,
 }
 
+/// `struct Name:` followed by indented `field: type` lines. Structs are
+/// heap-allocated and reference-counted like strings and arrays; releasing
+/// the last reference releases any heap-typed fields first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructDef {
+    pub name: String,
+    pub fields: Vec<Param>,
+    pub line: usize,
+}
+
+impl StructDef {
+    pub fn field(&self, name: &str) -> Option<(usize, Type)> {
+        self.fields
+            .iter()
+            .position(|f| f.name == name)
+            .map(|i| (i, self.fields[i].ty))
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Program {
     pub externs: Vec<ExternFn>,
     pub functions: Vec<Function>,
+    pub structs: Vec<StructDef>,
 }

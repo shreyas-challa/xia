@@ -66,23 +66,48 @@ impl SymbolTable {
 
 pub struct Analyzer {
     pub functions: HashMap<String, FnSig>,
+    structs: Vec<StructDef>,
+    struct_ids: HashMap<String, u32>,
     symbols: SymbolTable,
     current_ret: Type,
     loop_depth: usize,
 }
 
+const BUILTINS: &[&str] = &["print", "str", "len", "push", "pop", "find"];
+
 impl Analyzer {
     pub fn new() -> Self {
         Analyzer {
             functions: HashMap::new(),
+            structs: Vec::new(),
+            struct_ids: HashMap::new(),
             symbols: SymbolTable::new(),
             current_ret: Type::Unit,
             loop_depth: 0,
         }
     }
 
+    /// Resolve a type to a user-facing name (struct ids -> struct names).
+    fn type_name(&self, t: Type) -> String {
+        match t {
+            Type::Struct(id) => self.structs[id as usize].name.clone(),
+            Type::Array(e) => format!("[{}]", self.type_name(e.to_type())),
+            other => other.to_string(),
+        }
+    }
+
     /// Type-check the whole program, annotating expression types in place.
     pub fn analyze(&mut self, program: &mut Program) -> SResult<()> {
+        self.structs = program.structs.clone();
+        for (i, s) in self.structs.iter().enumerate() {
+            self.struct_ids.insert(s.name.clone(), i as u32);
+            if BUILTINS.contains(&s.name.as_str()) {
+                return Err(SemaError {
+                    span: Span::line_only(s.line),
+                    message: format!("struct `{}` collides with a builtin", s.name),
+                });
+            }
+        }
         // Register every signature first so call order doesn't matter.
         for e in &program.externs {
             let sig = FnSig {
@@ -107,6 +132,12 @@ impl Analyzer {
                 return Err(SemaError {
                     span: Span::line_only(f.line),
                     message: format!("duplicate definition of `{}`", f.name),
+                });
+            }
+            if self.struct_ids.contains_key(&f.name) {
+                return Err(SemaError {
+                    span: Span::line_only(f.line),
+                    message: format!("`{}` is defined as both a struct and a function", f.name),
                 });
             }
         }
@@ -232,6 +263,37 @@ impl Analyzer {
                         message: format!(
                             "type mismatch: cannot store {val_ty} in an array of {}",
                             elem.to_type()
+                        ),
+                    });
+                }
+                Ok(())
+            }
+            Stmt::FieldAssign { target, field, value, line: _ } => {
+                let bt = self.check_expr(target)?;
+                let Type::Struct(id) = bt else {
+                    return Err(SemaError {
+                        span: target.span,
+                        message: format!(
+                            "type {} has no fields to assign",
+                            self.type_name(bt)
+                        ),
+                    });
+                };
+                let def_name = self.structs[id as usize].name.clone();
+                let Some((_, fty)) = self.structs[id as usize].field(field) else {
+                    return Err(SemaError {
+                        span: target.span,
+                        message: format!("`{def_name}` has no field `{field}`"),
+                    });
+                };
+                let vt = self.check_expr(value)?;
+                if vt != fty {
+                    return Err(SemaError {
+                        span: value.span,
+                        message: format!(
+                            "type mismatch: field `{field}` of `{def_name}` is {}, found {}",
+                            self.type_name(fty),
+                            self.type_name(vt)
                         ),
                     });
                 }
@@ -385,10 +447,10 @@ impl Analyzer {
                         }
                     }
                     BinOp::Eq | BinOp::Ne => {
-                        if lt == Type::Unit || matches!(lt, Type::Array(_)) {
+                        if lt == Type::Unit || matches!(lt, Type::Array(_) | Type::Struct(_)) {
                             return Err(SemaError {
                                 span,
-                                message: format!("cannot compare values of type {lt}"),
+                                message: format!("cannot compare values of type {}", self.type_name(lt)),
                             });
                         }
                         Type::Bool
@@ -426,10 +488,10 @@ impl Analyzer {
                         });
                     }
                     let t = self.check_expr(&mut args[0])?;
-                    if t == Type::Unit || matches!(t, Type::Array(_)) {
+                    if t == Type::Unit || matches!(t, Type::Array(_) | Type::Struct(_)) {
                         return Err(SemaError {
                             span,
-                            message: format!("cannot print a value of type {t}"),
+                            message: format!("cannot print a value of type {}", self.type_name(t)),
                         });
                     }
                     Type::Unit
@@ -441,10 +503,10 @@ impl Analyzer {
                         });
                     }
                     let t = self.check_expr(&mut args[0])?;
-                    if t == Type::Unit || matches!(t, Type::Array(_)) {
+                    if t == Type::Unit || matches!(t, Type::Array(_) | Type::Struct(_)) {
                         return Err(SemaError {
                             span,
-                            message: format!("cannot convert a value of type {t} to str"),
+                            message: format!("cannot convert a value of type {} to str", self.type_name(t)),
                         });
                     }
                     Type::Str
@@ -520,6 +582,36 @@ impl Analyzer {
                         });
                     }
                     Type::Unit
+                } else if let Some(&id) = self.struct_ids.get(name.as_str()) {
+                    // Struct constructor: positional arguments, one per field.
+                    let def = self.structs[id as usize].clone();
+                    if args.len() != def.fields.len() {
+                        return Err(SemaError {
+                            span,
+                            message: format!(
+                                "`{}` has {} field(s), got {} argument(s)",
+                                def.name,
+                                def.fields.len(),
+                                args.len()
+                            ),
+                        });
+                    }
+                    for (arg, field) in args.iter_mut().zip(&def.fields) {
+                        let at = self.check_expr(arg)?;
+                        if at != field.ty {
+                            return Err(SemaError {
+                                span: arg.span,
+                                message: format!(
+                                    "field `{}` of `{}` is {}, found {}",
+                                    field.name,
+                                    def.name,
+                                    self.type_name(field.ty),
+                                    self.type_name(at)
+                                ),
+                            });
+                        }
+                    }
+                    Type::Struct(id)
                 } else {
                     let sig = self
                         .functions
@@ -614,6 +706,24 @@ impl Analyzer {
                     });
                 }
                 elem_ty
+            }
+            ExprKind::Field(base, fname) => {
+                let span = expr.span;
+                let bt = self.check_expr(base)?;
+                let Type::Struct(id) = bt else {
+                    return Err(SemaError {
+                        span,
+                        message: format!("type {} has no fields", self.type_name(bt)),
+                    });
+                };
+                let def = &self.structs[id as usize];
+                let Some((_, fty)) = def.field(fname) else {
+                    return Err(SemaError {
+                        span,
+                        message: format!("`{}` has no field `{fname}`", def.name),
+                    });
+                };
+                fty
             }
         };
         expr.ty = Some(ty);
@@ -791,5 +901,66 @@ mod tests {
             panic!()
         };
         assert_eq!(*ty, Some(Type::Str));
+    }
+
+    #[test]
+    fn struct_constructor_and_fields_type_check() {
+        let src = "struct Point:\n    x: int\n    y: int\nfn main():\n    let p = Point(1, 2)\n    print(p.x + p.y)\n";
+        let prog = analyze(src).unwrap();
+        let Stmt::Let { ty, .. } = &prog.functions[0].body[0] else {
+            panic!()
+        };
+        assert_eq!(*ty, Some(Type::Struct(0)));
+
+        // wrong arity
+        assert!(
+            analyze("struct P:\n    x: int\n    y: int\nfn main():\n    let p = P(1)\n").is_err(),
+            "too few fields"
+        );
+        // wrong field type
+        assert!(
+            analyze("struct P:\n    x: int\nfn main():\n    let p = P(true)\n").is_err(),
+            "field type mismatch"
+        );
+        // unknown field access
+        assert!(
+            analyze("struct P:\n    x: int\nfn main():\n    let p = P(1)\n    print(p.z)\n")
+                .is_err(),
+            "unknown field"
+        );
+        // field assignment is type-checked
+        assert!(
+            analyze("struct P:\n    x: int\nfn main():\n    let p = P(1)\n    p.x = \"s\"\n")
+                .is_err(),
+            "field assign type mismatch"
+        );
+    }
+
+    #[test]
+    fn structs_not_printable_or_comparable() {
+        assert!(
+            analyze("struct P:\n    x: int\nfn main():\n    let p = P(1)\n    print(p)\n").is_err(),
+            "struct not printable"
+        );
+        assert!(
+            analyze(
+                "struct P:\n    x: int\nfn main():\n    let a = P(1)\n    let b = P(1)\n    let e = a == b\n"
+            )
+            .is_err(),
+            "struct not comparable"
+        );
+        // and a struct can't be str()'d or interpolated
+        assert!(
+            analyze("struct P:\n    x: int\nfn main():\n    let p = P(1)\n    print(str(p))\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn struct_name_cannot_collide_with_builtin_or_fn() {
+        assert!(
+            analyze("struct print:\n    x: int\nfn main():\n    return\n").is_err(),
+            "struct shadowing a builtin is rejected"
+        );
     }
 }

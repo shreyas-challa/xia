@@ -74,6 +74,10 @@ hello, world!
   words. Indexing is bounds-checked (out of bounds prints a diagnostic and
   exits with code 1). Arrays retain their heap elements; releasing the last
   reference releases every element before freeing the buffer.
+- A `struct` is `[header][field0][field1]...` with one 8-byte word per field.
+  Structs with no heap fields use kind 0; structs that own heap data store the
+  address of a generated destructor (`xia_drop_<Name>`) in the kind word, so
+  `xia_release` dispatches to it and releases each heap field before freeing.
 - The compiler inserts all retain/release calls; there is nothing to call
   manually and no GC pause. Function arguments are borrowed, returns are +1,
   and `str` results from `extern` functions are copied into Xia-owned memory.
@@ -117,8 +121,12 @@ Linux/macOS it uses the system `cc`.
 
 ## Language reference (v0.2)
 
-- Types: `int`, `float`, `bool`, `str`, `[T]` arrays; functions may return
-  nothing (unit). Nested arrays are not supported yet.
+- Types: `int`, `float`, `bool`, `str`, `[T]` arrays, and `struct`s;
+  functions may return nothing (unit). Nested arrays are not supported yet.
+- `struct Name:` followed by an indented `field: type` per line declares a
+  product type. Construct with positional arguments (`Name(a, b)`), read and
+  assign fields with `.` (`p.x`, `p.x = 5`). Struct types resolve regardless
+  of declaration order. See `examples/structs.xia`.
 - `let x = expr` (inferred) or `let x: type = expr`; assignment with `=`.
   An empty array literal needs an annotation: `let xs: [int] = []`.
 - `if` / `elif` / `else`, `while`, `break`, `continue` — blocks by

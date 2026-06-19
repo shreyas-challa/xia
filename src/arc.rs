@@ -175,6 +175,7 @@ impl ArcInserter {
                 }
                 other @ (Stmt::Assign { .. }
                 | Stmt::IndexAssign { .. }
+                | Stmt::FieldAssign { .. }
                 | Stmt::Retain(_)
                 | Stmt::Release(_)) => {
                     out.push(other);

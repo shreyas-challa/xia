@@ -1,0 +1,33 @@
+# Structs: named product types with reference-counted heap fields.
+#
+# A struct that holds heap data (str, arrays, other structs with heap fields)
+# gets an automatically generated destructor that releases those fields when
+# the value dies. Scalar-only structs are free of any bookkeeping.
+
+struct Point:
+    x: int
+    y: int
+
+struct Person:
+    name: str
+    home: Point
+    age: int
+
+fn birthday(p: Person) -> Person:
+    p.age = p.age + 1
+    return p
+
+fn main() -> int:
+    let home = Point(6, 4)
+    let p = birthday(Person("ada", home, 35))
+    print(f"{p.name} is {p.age}, at ({p.home.x}, {p.home.y})")
+
+    # Reassigning a heap field releases the old string and retains the new one.
+    p.name = p.name + " lovelace"
+    print(p.name)
+
+    # Structs live happily inside arrays; the array owns its elements.
+    let crowd = [p, Person("grace", Point(1, 2), 40)]
+    for person in crowd:
+        print(person.name)
+    return 0
