@@ -153,6 +153,9 @@ pub enum ExprKind {
     Unary(UnOp, Box<Expr>),
     Binary(Box<Expr>, BinOp, Box<Expr>),
     Call(String, Vec<Expr>),
+    /// `receiver.method(args)` — a struct method call. Lowered to a direct
+    /// call passing the receiver as an implicit first argument.
+    MethodCall(Box<Expr>, String, Vec<Expr>),
     /// `[e1, e2, ...]` — an empty literal needs a type annotation.
     ArrayLit(Vec<Expr>),
     /// `base[index]`
@@ -241,10 +244,21 @@ pub struct Param {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Function {
     pub name: String,
+    /// `Some` for a struct method `fn (p: Point) area():` — the explicit
+    /// receiver, which is not part of `params`. Its type must be a struct.
+    pub recv: Option<Param>,
     pub params: Vec<Param>,
     pub ret: Type,
     pub body: Block,
     pub line: usize,
+}
+
+impl Function {
+    /// The mangled symbol name for a method (`Struct.method`), given the
+    /// receiver's struct name. Free functions keep their bare name.
+    pub fn method_symbol(struct_name: &str, method: &str) -> String {
+        format!("{struct_name}.{method}")
+    }
 }
 
 /// `extern fn name(t1, t2, ...) -> ret` — a zero-cost C FFI declaration.

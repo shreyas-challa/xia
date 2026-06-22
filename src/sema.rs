@@ -66,6 +66,9 @@ impl SymbolTable {
 
 pub struct Analyzer {
     pub functions: HashMap<String, FnSig>,
+    /// Struct methods, keyed by (struct id, method name). The signature's
+    /// `params` exclude the implicit receiver.
+    methods: HashMap<(u32, String), FnSig>,
     structs: Vec<StructDef>,
     struct_ids: HashMap<String, u32>,
     symbols: SymbolTable,
@@ -79,6 +82,7 @@ impl Analyzer {
     pub fn new() -> Self {
         Analyzer {
             functions: HashMap::new(),
+            methods: HashMap::new(),
             structs: Vec::new(),
             struct_ids: HashMap::new(),
             symbols: SymbolTable::new(),
@@ -128,6 +132,30 @@ impl Analyzer {
                 varargs: false,
                 ret: f.ret,
             };
+            if let Some(recv) = &f.recv {
+                // A method: keyed by (receiver struct, method name), separate
+                // from the free-function namespace.
+                let Type::Struct(id) = recv.ty else {
+                    return Err(SemaError {
+                        span: Span::line_only(f.line),
+                        message: format!(
+                            "method receiver `{}` must be a struct, found {}",
+                            recv.name,
+                            self.type_name(recv.ty)
+                        ),
+                    });
+                };
+                if self.methods.insert((id, f.name.clone()), sig).is_some() {
+                    return Err(SemaError {
+                        span: Span::line_only(f.line),
+                        message: format!(
+                            "duplicate method `{}` on `{}`",
+                            f.name, self.structs[id as usize].name
+                        ),
+                    });
+                }
+                continue;
+            }
             if self.functions.insert(f.name.clone(), sig).is_some() {
                 return Err(SemaError {
                     span: Span::line_only(f.line),
@@ -151,6 +179,9 @@ impl Analyzer {
     fn check_function(&mut self, f: &mut Function) -> SResult<()> {
         self.current_ret = f.ret;
         self.symbols = SymbolTable::new();
+        if let Some(recv) = &f.recv {
+            self.symbols.declare(&recv.name, recv.ty);
+        }
         for p in &f.params {
             if !self.symbols.declare(&p.name, p.ty) {
                 return Err(SemaError {
@@ -652,6 +683,55 @@ impl Analyzer {
                     sig.ret
                 }
             }
+            ExprKind::MethodCall(recv, method, args) => {
+                let span = expr.span;
+                let recv_ty = self.check_expr(recv)?;
+                let Type::Struct(id) = recv_ty else {
+                    return Err(SemaError {
+                        span: recv.span,
+                        message: format!(
+                            "type {} has no methods to call",
+                            self.type_name(recv_ty)
+                        ),
+                    });
+                };
+                let Some(sig) = self.methods.get(&(id, method.clone())).cloned() else {
+                    return Err(SemaError {
+                        span,
+                        message: format!(
+                            "`{}` has no method `{method}`",
+                            self.structs[id as usize].name
+                        ),
+                    });
+                };
+                if args.len() != sig.params.len() {
+                    return Err(SemaError {
+                        span,
+                        message: format!(
+                            "method `{method}` of `{}` expects {} argument(s), got {}",
+                            self.structs[id as usize].name,
+                            sig.params.len(),
+                            args.len()
+                        ),
+                    });
+                }
+                for (i, arg) in args.iter_mut().enumerate() {
+                    let at = self.check_expr(arg)?;
+                    let expected = sig.params[i];
+                    if at != expected {
+                        return Err(SemaError {
+                            span: arg.span,
+                            message: format!(
+                                "argument {} of `{method}`: expected {}, found {}",
+                                i + 1,
+                                self.type_name(expected),
+                                self.type_name(at)
+                            ),
+                        });
+                    }
+                }
+                sig.ret
+            }
             ExprKind::ArrayLit(elems) => {
                 let span = expr.span;
                 if elems.is_empty() {
@@ -975,6 +1055,69 @@ mod tests {
         assert!(
             analyze("struct P:\n    x: int\nfn main():\n    let p = P(1)\n    print(str(p))\n")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn methods_type_check_and_dispatch_on_receiver() {
+        let src = "struct Point:\n    x: int\n    y: int\nfn (p: Point) area() -> int:\n    return p.x * p.y\nfn main() -> int:\n    let p = Point(3, 4)\n    return p.area()\n";
+        let prog = analyze(src).unwrap();
+        // the call resolves to int
+        let Stmt::Return { value: Some(e), .. } = &prog.functions[1].body[1] else {
+            panic!()
+        };
+        assert_eq!(e.ty, Some(Type::Int));
+
+        // method args are checked
+        let with_arg = "struct V:\n    n: int\nfn (v: V) plus(k: int) -> int:\n    return v.n + k\nfn main() -> int:\n    let v = V(1)\n    return v.plus(2)\n";
+        assert!(analyze(with_arg).is_ok());
+        // wrong arg type
+        assert!(
+            analyze("struct V:\n    n: int\nfn (v: V) plus(k: int) -> int:\n    return v.n + k\nfn main() -> int:\n    let v = V(1)\n    return v.plus(true)\n")
+                .is_err(),
+            "arg type mismatch"
+        );
+        // wrong arity
+        assert!(
+            analyze("struct V:\n    n: int\nfn (v: V) plus(k: int) -> int:\n    return v.n + k\nfn main() -> int:\n    let v = V(1)\n    return v.plus()\n")
+                .is_err(),
+            "arity mismatch"
+        );
+    }
+
+    #[test]
+    fn calling_unknown_method_or_on_non_struct_rejected() {
+        // unknown method on a struct
+        assert!(
+            analyze("struct P:\n    x: int\nfn main():\n    let p = P(1)\n    p.nope()\n").is_err(),
+            "unknown method"
+        );
+        // method call on a non-struct
+        assert!(
+            analyze("fn main():\n    let n = 5\n    n.area()\n").is_err(),
+            "non-struct receiver"
+        );
+    }
+
+    #[test]
+    fn same_method_name_on_different_structs_is_fine() {
+        let src = "struct A:\n    n: int\nstruct B:\n    n: int\nfn (a: A) get() -> int:\n    return a.n\nfn (b: B) get() -> int:\n    return b.n + 1\nfn main() -> int:\n    let a = A(1)\n    let b = B(1)\n    return a.get() + b.get()\n";
+        assert!(analyze(src).is_ok());
+        // a duplicate method on the same struct is rejected
+        assert!(
+            analyze("struct A:\n    n: int\nfn (a: A) get() -> int:\n    return a.n\nfn (a: A) get() -> int:\n    return 0\nfn main():\n    return\n")
+                .is_err(),
+            "duplicate method"
+        );
+    }
+
+    #[test]
+    fn method_receiver_must_be_a_struct() {
+        // a method can't be declared on a builtin type
+        assert!(parse("fn (x: int) f() -> int:\n    return x\n").is_ok(), "parses fine");
+        assert!(
+            analyze("fn (x: int) f() -> int:\n    return x\nfn main():\n    return\n").is_err(),
+            "non-struct receiver rejected by sema"
         );
     }
 

@@ -251,6 +251,18 @@ impl Parser {
     fn parse_function(&mut self) -> PResult<Function> {
         let line = self.line();
         self.expect(TokKind::Fn)?;
+        // A leading `(recv: Type)` before the name marks a struct method:
+        // `fn (p: Point) area() -> int:`.
+        let recv = if self.peek() == &TokKind::LParen {
+            self.advance();
+            let rname = self.expect_ident()?;
+            self.expect(TokKind::Colon)?;
+            let rty = self.parse_type()?;
+            self.expect(TokKind::RParen)?;
+            Some(Param { name: rname, ty: rty })
+        } else {
+            None
+        };
         let name = self.expect_ident()?;
         self.expect(TokKind::LParen)?;
         let mut params = Vec::new();
@@ -267,7 +279,7 @@ impl Parser {
         let ret = self.parse_return_type()?;
         self.expect(TokKind::Colon)?;
         let body = self.parse_block()?;
-        Ok(Function { name, params, ret, body, line })
+        Ok(Function { name, recv, params, ret, body, line })
     }
 
     // ----- statements ---------------------------------------------------
@@ -564,8 +576,21 @@ impl Parser {
                 }
                 TokKind::Dot => {
                     self.advance();
-                    let field = self.expect_ident()?;
-                    expr = Expr::new(ExprKind::Field(Box::new(expr), field), span);
+                    let name = self.expect_ident()?;
+                    // `.name(args)` is a method call; `.name` is a field access.
+                    if self.check(&TokKind::LParen) {
+                        let mut args = Vec::new();
+                        while !self.check(&TokKind::RParen) {
+                            args.push(self.parse_expression()?);
+                            if !self.check(&TokKind::Comma) {
+                                self.expect(TokKind::RParen)?;
+                                break;
+                            }
+                        }
+                        expr = Expr::new(ExprKind::MethodCall(Box::new(expr), name, args), span);
+                    } else {
+                        expr = Expr::new(ExprKind::Field(Box::new(expr), name), span);
+                    }
                 }
                 _ => break,
             }
@@ -722,6 +747,12 @@ fn respan(e: &mut Expr, span: Span) {
             respan(b, span);
         }
         ExprKind::Call(_, args) | ExprKind::ArrayLit(args) => {
+            for a in args {
+                respan(a, span);
+            }
+        }
+        ExprKind::MethodCall(recv, _, args) => {
+            respan(recv, span);
             for a in args {
                 respan(a, span);
             }
@@ -915,6 +946,41 @@ mod tests {
             &prog.functions[0].body[0],
             Stmt::FieldAssign { field, .. } if field == "x"
         ));
+    }
+
+    #[test]
+    fn parses_method_decl_and_call() {
+        let src = "struct Point:\n    x: int\n    y: int\nfn (p: Point) area() -> int:\n    return p.x * p.y\nfn main() -> int:\n    let p = Point(3, 4)\n    return p.area()\n";
+        let prog = parse(src).unwrap();
+        let m = &prog.functions[0];
+        assert_eq!(m.name, "area");
+        assert_eq!(m.recv, Some(Param { name: "p".into(), ty: Type::Struct(0) }));
+        assert!(m.params.is_empty());
+        // the call site is a MethodCall on a Var receiver
+        let Stmt::Return { value: Some(e), .. } = &prog.functions[1].body[1] else {
+            panic!("expected return");
+        };
+        let ExprKind::MethodCall(recv, name, args) = &e.kind else {
+            panic!("expected method call, got {:?}", e.kind);
+        };
+        assert_eq!(name, "area");
+        assert!(args.is_empty());
+        assert!(matches!(&recv.kind, ExprKind::Var(v) if v == "p"));
+    }
+
+    #[test]
+    fn method_with_args_and_field_access_disambiguated() {
+        let src = "struct V:\n    n: int\nfn (v: V) plus(k: int) -> int:\n    return v.n + k\nfn main() -> int:\n    let v = V(10)\n    return v.plus(5) + v.n\n";
+        let prog = parse(src).unwrap();
+        let Stmt::Return { value: Some(e), .. } = &prog.functions[1].body[1] else {
+            panic!("expected return");
+        };
+        // (v.plus(5)) + (v.n): add of a MethodCall and a Field
+        let ExprKind::Binary(lhs, BinOp::Add, rhs) = &e.kind else {
+            panic!("expected add");
+        };
+        assert!(matches!(&lhs.kind, ExprKind::MethodCall(_, n, a) if n == "plus" && a.len() == 1));
+        assert!(matches!(&rhs.kind, ExprKind::Field(_, f) if f == "n"));
     }
 
     #[test]

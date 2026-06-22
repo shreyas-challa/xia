@@ -129,15 +129,21 @@ impl<'ctx> CodeGen<'ctx> {
                 .add_function(&e.name, self.fn_type(&e.params, e.ret, e.varargs), None);
         }
         for f in &program.functions {
-            self.sigs.insert(f.name.clone(), (false, f.ret));
+            // Free functions are keyed by bare name (the str-dup call logic
+            // looks them up that way); methods by their mangled symbol so the
+            // method-call site can find the return type.
+            let key = match f.recv {
+                Some(_) => self.fn_symbol(f),
+                None => f.name.clone(),
+            };
+            self.sigs.insert(key, (false, f.ret));
         }
 
         // Declare all user functions first so call order doesn't matter.
         for f in &program.functions {
-            let name = if f.name == "main" { "xia_main" } else { &f.name };
-            let params: Vec<Type> = f.params.iter().map(|p| p.ty).collect();
+            let params = self.fn_params(f);
             self.module
-                .add_function(name, self.fn_type(&params, f.ret, false), None);
+                .add_function(&self.fn_symbol(f), self.fn_type(&params, f.ret, false), None);
         }
 
         for f in &program.functions {
@@ -176,9 +182,32 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    /// The LLVM symbol name for a function: `xia_main` for `main`, the mangled
+    /// `Struct.method` for a method, otherwise the bare name.
+    fn fn_symbol(&self, f: &Function) -> String {
+        match &f.recv {
+            Some(r) => {
+                let Type::Struct(id) = r.ty else {
+                    unreachable!("method receiver must be a struct")
+                };
+                Function::method_symbol(&self.structs[id as usize].name, &f.name)
+            }
+            None if f.name == "main" => "xia_main".to_string(),
+            None => f.name.clone(),
+        }
+    }
+
+    /// Full parameter type list, with a method's receiver prepended.
+    fn fn_params(&self, f: &Function) -> Vec<Type> {
+        f.recv
+            .iter()
+            .chain(f.params.iter())
+            .map(|p| p.ty)
+            .collect()
+    }
+
     fn compile_function(&mut self, f: &Function) -> CResult<()> {
-        let name = if f.name == "main" { "xia_main" } else { &f.name };
-        let function = self.module.get_function(name).unwrap();
+        let function = self.module.get_function(&self.fn_symbol(f)).unwrap();
         let entry = self.context.append_basic_block(function, "entry");
         self.builder.position_at_end(entry);
 
@@ -186,7 +215,8 @@ impl<'ctx> CodeGen<'ctx> {
         self.variables.push(HashMap::new());
         self.loop_stack.clear();
 
-        for (i, p) in f.params.iter().enumerate() {
+        // The receiver, if any, is the implicit first parameter.
+        for (i, p) in f.recv.iter().chain(f.params.iter()).enumerate() {
             let slot = self
                 .builder
                 .build_alloca(self.basic_type(p.ty), &p.name)
@@ -627,6 +657,10 @@ impl<'ctx> CodeGen<'ctx> {
                 self.compile_call(name, args, e.span.line)?;
                 Ok(None)
             }
+            (ExprKind::MethodCall(recv, method, args), Some(Type::Unit)) => {
+                self.compile_method_call(recv, method, args, e.span.line)?;
+                Ok(None)
+            }
             _ => Ok(Some(self.compile_expr(e)?)),
         }
     }
@@ -664,6 +698,12 @@ impl<'ctx> CodeGen<'ctx> {
             ExprKind::Call(name, args) => {
                 self.compile_call(name, args, e.span.line)?
                     .ok_or_else(|| format!("codegen: `{name}` returns no value (line {})", e.span.line))
+            }
+            ExprKind::MethodCall(recv, method, args) => {
+                self.compile_method_call(recv, method, args, e.span.line)?
+                    .ok_or_else(|| {
+                        format!("codegen: method `{method}` returns no value (line {})", e.span.line)
+                    })
             }
             ExprKind::ArrayLit(elems) => {
                 let Some(elem) = e.ty.and_then(Type::array_elem) else {
@@ -1188,6 +1228,45 @@ impl<'ctx> CodeGen<'ctx> {
                 result = Some(ptr.into());
             }
             self.stmt_temps.push(ptr);
+        }
+        Ok(result)
+    }
+
+    /// `recv.method(args)` — a direct call to the mangled `Struct.method`
+    /// symbol with the receiver passed as the implicit first argument. The
+    /// receiver and arguments are borrowed; the result is owned (+1).
+    fn compile_method_call(
+        &mut self,
+        recv: &Expr,
+        method: &str,
+        args: &[Expr],
+        line: usize,
+    ) -> CResult<Option<BasicValueEnum<'ctx>>> {
+        let Some(Type::Struct(id)) = recv.ty else {
+            return Err(format!("codegen: method call on a non-struct (line {line})"));
+        };
+        let fn_name = Function::method_symbol(&self.structs[id as usize].name, method);
+        let callee = self
+            .module
+            .get_function(&fn_name)
+            .ok_or_else(|| format!("codegen: unknown method `{fn_name}` (line {line})"))?;
+        let mut compiled: Vec<BasicMetadataValueEnum> = Vec::with_capacity(args.len() + 1);
+        compiled.push(self.compile_expr(recv)?.into());
+        for a in args {
+            compiled.push(self.compile_expr(a)?.into());
+        }
+        let result = self
+            .builder
+            .build_call(callee, &compiled, "")
+            .map_err(err)?
+            .try_as_basic_value()
+            .left();
+        // A heap result is owned; track it as a statement temp so it is
+        // released if discarded (or consumed when bound / returned).
+        if let Some((_, ret)) = self.sigs.get(&fn_name).copied() {
+            if ret.is_heap() {
+                self.stmt_temps.push(result.unwrap().into_pointer_value());
+            }
         }
         Ok(result)
     }

@@ -64,7 +64,9 @@ impl ArcInserter {
         self.scopes.clear();
         let mut fn_scope = Scope { kind: ScopeKind::Function, owned: Vec::new() };
         let mut prologue = Vec::new();
-        for p in &f.params {
+        // The receiver of a method is borrowed like any parameter: retain on
+        // entry, release on exit (a struct receiver is always heap).
+        for p in f.recv.iter().chain(f.params.iter()) {
             if p.ty.is_heap() {
                 prologue.push(Stmt::Retain(p.name.clone()));
                 fn_scope.owned.push(p.name.clone());
