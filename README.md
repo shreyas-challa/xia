@@ -104,7 +104,7 @@ it:
 ```powershell
 $env:LLVM_SYS_181_PREFIX = "C:\path\to\llvm-18.1.8-windows-amd64-msvc17-msvcrt"
 cargo build --release
-cargo test        # 71 unit/IR tests + 11 end-to-end binary tests
+cargo test        # 98 unit/IR tests + 17 end-to-end binary tests
 ```
 
 On Linux the distro packages work directly (see `.github/workflows/ci.yml`,
@@ -127,6 +127,12 @@ Linux/macOS it uses the system `cc`.
   product type. Construct with positional arguments (`Name(a, b)`), read and
   assign fields with `.` (`p.x`, `p.x = 5`). Struct types resolve regardless
   of declaration order. See `examples/structs.xia`.
+- Methods take an explicit receiver before the name —
+  `fn (p: Point) area() -> int:` — and are called as `p.area(args)`. The
+  receiver is borrowed (like any parameter) and the result is owned by the
+  caller; calls compile to a direct call to a `Struct.method` symbol with the
+  receiver passed as the implicit first argument (no vtables). Different
+  structs may share a method name.
 - `let x = expr` (inferred) or `let x: type = expr`; assignment with `=`.
   An empty array literal needs an annotation: `let xs: [int] = []`.
 - `if` / `elif` / `else`, `while`, `break`, `continue` — blocks by

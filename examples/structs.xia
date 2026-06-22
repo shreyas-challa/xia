@@ -1,4 +1,5 @@
-# Structs: named product types with reference-counted heap fields.
+# Structs: named product types with reference-counted heap fields, plus
+# methods declared with an explicit receiver.
 #
 # A struct that holds heap data (str, arrays, other structs with heap fields)
 # gets an automatically generated destructor that releases those fields when
@@ -8,19 +9,32 @@ struct Point:
     x: int
     y: int
 
+# A method takes its receiver before the name: `fn (p: Point) area()`.
+# It is called as `p.area()`; the receiver is borrowed, the result is owned.
+fn (p: Point) area() -> int:
+    return p.x * p.y
+
+fn (p: Point) show() -> str:
+    return f"({p.x}, {p.y})"
+
 struct Person:
     name: str
     home: Point
     age: int
 
-fn birthday(p: Person) -> Person:
-    p.age = p.age + 1
-    return p
+# Methods may return a fresh struct — here an aged copy of the receiver.
+fn (p: Person) birthday() -> Person:
+    return Person(p.name, p.home, p.age + 1)
+
+fn (p: Person) greeting() -> str:
+    return f"{p.name} is {p.age}, at {p.home.show()}"
 
 fn main() -> int:
     let home = Point(6, 4)
-    let p = birthday(Person("ada", home, 35))
-    print(f"{p.name} is {p.age}, at ({p.home.x}, {p.home.y})")
+    print(home.area())
+
+    let p = Person("ada", home, 35).birthday()
+    print(p.greeting())
 
     # Reassigning a heap field releases the old string and retains the new one.
     p.name = p.name + " lovelace"
@@ -29,5 +43,5 @@ fn main() -> int:
     # Structs live happily inside arrays; the array owns its elements.
     let crowd = [p, Person("grace", Point(1, 2), 40)]
     for person in crowd:
-        print(person.name)
+        print(person.greeting())
     return 0

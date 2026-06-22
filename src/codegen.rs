@@ -2632,6 +2632,26 @@ mod tests {
     }
 
     #[test]
+    fn methods_lower_to_mangled_symbols_with_receiver_param() {
+        // `fn (p: Point) area()` becomes `@"Point.area"(ptr)` and `p.area()`
+        // is a direct call passing the receiver as the first argument.
+        let src = "struct Point:\n    x: int\n    y: int\nfn (p: Point) area() -> int:\n    return p.x * p.y\nfn main() -> int:\n    let p = Point(3, 4)\n    return p.area()\n";
+        let ir = compile_to_ir(src).unwrap();
+        assert!(ir.contains("@Point.area(ptr"), "method takes the receiver ptr");
+        assert!(ir.contains("call i64 @Point.area"), "call site is direct");
+    }
+
+    #[test]
+    fn method_returning_heap_value_is_arc_balanced() {
+        // A method returning a str is owned by the caller; the discarded result
+        // must be released, and the runtime ARC helpers are emitted.
+        let src = "struct Tag:\n    label: str\nfn (t: Tag) shout() -> str:\n    return t.label + \"!\"\nfn main():\n    let t = Tag(\"hi\")\n    print(t.shout())\n";
+        let ir = compile_to_ir(src).unwrap();
+        assert!(ir.contains("call ptr @Tag.shout"));
+        assert!(ir.contains("@xia_release"), "owned str result is released");
+    }
+
+    #[test]
     fn struct_without_heap_fields_uses_zero_kind() {
         // A struct of only scalar fields needs no destructor; its kind word is 0
         // and no drop fn is generated for it.

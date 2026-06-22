@@ -225,6 +225,55 @@ fn main() -> int:
 }
 
 #[test]
+fn struct_methods_dispatch_chain_and_arc() {
+    // Methods with and without args, a method returning a fresh struct, method
+    // chaining (`p.scaled(2).area()`), heap-field methods, and reassigning a
+    // struct from a method result — all under -O3 so ARC stays balanced.
+    let src = r#"struct Point:
+    x: int
+    y: int
+
+fn (p: Point) area() -> int:
+    return p.x * p.y
+
+fn (p: Point) scaled(k: int) -> Point:
+    return Point(p.x * k, p.y * k)
+
+fn (p: Point) show() -> str:
+    return f"({p.x}, {p.y})"
+
+fn (p: Point) doubled_area() -> int:
+    return p.scaled(2).area()
+
+struct Counter:
+    name: str
+    n: int
+
+fn (c: Counter) bump() -> Counter:
+    return Counter(c.name, c.n + 1)
+
+fn (c: Counter) describe() -> str:
+    return f"{c.name}: {c.n}"
+
+fn main() -> int:
+    let p = Point(3, 4)
+    print(p.area())
+    let q = p.scaled(2)
+    print(q.area())
+    print(q.show())
+    print(p.doubled_area())
+    let c = Counter("hits", 0)
+    c = c.bump()
+    c = c.bump()
+    print(c.describe())
+    return 0
+"#;
+    let (stdout, code) = compile_and_run("e2e_methods", src, &["--release"]);
+    assert_eq!(stdout, "12\n48\n(6, 8)\n48\nhits: 2\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
 fn out_of_bounds_index_traps() {
     let src = "fn main() -> int:\n    let xs = [1, 2]\n    print(xs[5])\n    return 0\n";
     let (stdout, code) = compile_and_run("e2e_oob", src, &[]);
