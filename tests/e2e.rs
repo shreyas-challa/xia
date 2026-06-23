@@ -274,6 +274,72 @@ fn main() -> int:
 }
 
 #[test]
+fn enums_match_payloads_recursion_and_arc() {
+    // Tagged unions with mixed payloads, exhaustive and wildcard matches, a
+    // self-referential enum (a cons list) built by reassignment and summed by
+    // recursion, and a str-payload variant — all under -O3 so the per-enum
+    // drop functions and arm-binding retains/releases must stay balanced.
+    let src = r#"enum Shape:
+    Circle(int)
+    Rect(int, int)
+    Nothing
+
+fn area(s: Shape) -> int:
+    match s:
+        Circle(r):
+            return r * r * 3
+        Rect(w, h):
+            return w * h
+        Nothing:
+            return 0
+
+enum IntList:
+    Cons(int, IntList)
+    Nil
+
+fn sum(xs: IntList) -> int:
+    match xs:
+        Cons(head, tail):
+            return head + sum(tail)
+        Nil:
+            return 0
+
+fn build(n: int) -> IntList:
+    let acc = Nil
+    let i = 1
+    while i <= n:
+        acc = Cons(i, acc)
+        i = i + 1
+    return acc
+
+enum Msg:
+    Text(str)
+    Code(int)
+    Quit
+
+fn render(m: Msg) -> str:
+    match m:
+        Text(s):
+            return "text: " + s
+        _:
+            return "other"
+
+fn main() -> int:
+    print(area(Circle(2)))
+    print(area(Rect(3, 4)))
+    print(area(Nothing))
+    print(sum(build(5)))
+    print(render(Text("hi")))
+    print(render(Code(7)))
+    print(render(Quit))
+    return 0
+"#;
+    let (stdout, code) = compile_and_run("e2e_enums", src, &["--release"]);
+    assert_eq!(stdout, "12\n12\n0\n15\ntext: hi\nother\nother\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
 fn out_of_bounds_index_traps() {
     let src = "fn main() -> int:\n    let xs = [1, 2]\n    print(xs[5])\n    return 0\n";
     let (stdout, code) = compile_and_run("e2e_oob", src, &[]);

@@ -78,6 +78,12 @@ hello, world!
   Structs with no heap fields use kind 0; structs that own heap data store the
   address of a generated destructor (`xia_drop_<Name>`) in the kind word, so
   `xia_release` dispatches to it and releases each heap field before freeing.
+- An `enum` is a tagged union `[header][i64 tag][payload...]`, sized to the
+  constructed variant; the value points at the tag and payload field `j` sits
+  at `+8 + j*8`. Like structs, a scalar-only enum uses kind 0, while one whose
+  variants own heap data stores `xia_drop_<Name>` in the kind word — that
+  destructor switches on the tag and releases the live variant's heap fields.
+  Self-referential enums (e.g. a cons list) are released recursively.
 - The compiler inserts all retain/release calls; there is nothing to call
   manually and no GC pause. Function arguments are borrowed, returns are +1,
   and `str` results from `extern` functions are copied into Xia-owned memory.
@@ -104,7 +110,7 @@ it:
 ```powershell
 $env:LLVM_SYS_181_PREFIX = "C:\path\to\llvm-18.1.8-windows-amd64-msvc17-msvcrt"
 cargo build --release
-cargo test        # 98 unit/IR tests + 17 end-to-end binary tests
+cargo test        # 115 unit/IR tests + 18 end-to-end binary tests
 ```
 
 On Linux the distro packages work directly (see `.github/workflows/ci.yml`,
@@ -122,7 +128,7 @@ Linux/macOS it uses the system `cc`.
 ## Language reference (v0.2)
 
 - Types: `int`, `float`, `bool`, `str`, `[T]` arrays (including nested
-  `[[T]]`), and `struct`s; functions may return nothing (unit).
+  `[[T]]`), `struct`s, and `enum`s; functions may return nothing (unit).
 - `struct Name:` followed by an indented `field: type` per line declares a
   product type. Construct with positional arguments (`Name(a, b)`), read and
   assign fields with `.` (`p.x`, `p.x = 5`). Struct types resolve regardless
@@ -133,6 +139,24 @@ Linux/macOS it uses the system `cc`.
   caller; calls compile to a direct call to a `Struct.method` symbol with the
   receiver passed as the implicit first argument (no vtables). Different
   structs may share a method name.
+- `enum Name:` followed by indented variant lines declares a tagged union;
+  a variant is a bare name (`Nil`) or carries a positional payload
+  (`Cons(int, IntList)`, `Some(str)`). Variant names are global and unique, so
+  they construct without qualification: `Some(x)`, `Nil`. Enum types resolve
+  regardless of declaration order and may be self-referential. Take a value
+  apart with `match`:
+
+  ```
+  match shape:
+      Circle(r): return r * r * 3
+      Rect(w, h): return w * h
+      Nothing: return 0
+  ```
+
+  Each arm names a variant and binds its payload positionally (in scope only
+  within that arm), or is the catch-all `_`. A `match` must be exhaustive or
+  end in a `_` arm; duplicate and unknown-variant arms are rejected. See
+  `examples/enums.xia`.
 - `let x = expr` (inferred) or `let x: type = expr`; assignment with `=`.
   An empty array literal needs an annotation: `let xs: [int] = []`.
 - `if` / `elif` / `else`, `while`, `break`, `continue` — blocks by
