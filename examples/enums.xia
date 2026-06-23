@@ -1,0 +1,67 @@
+# Enums: tagged unions with payloads, and `match` to take them apart.
+#
+# An enum value is a heap-allocated, reference-counted block carrying a tag
+# and that variant's payload. Variants with heap payloads (str, arrays, other
+# structs/enums) get an automatically generated destructor; scalar-only enums
+# are free of any bookkeeping. `match` must be exhaustive or end in a `_` arm.
+
+enum Shape:
+    Circle(int)
+    Rect(int, int)
+    Nothing
+
+fn area(s: Shape) -> int:
+    match s:
+        Circle(r):
+            return r * r * 3
+        Rect(w, h):
+            return w * h
+        Nothing:
+            return 0
+
+# A self-referential enum: a singly linked list of ints. The `Cons` payload
+# owns the tail, so the whole chain is released when the head dies.
+enum IntList:
+    Cons(int, IntList)
+    Nil
+
+fn sum(xs: IntList) -> int:
+    match xs:
+        Cons(head, tail):
+            return head + sum(tail)
+        Nil:
+            return 0
+
+# Build 1..n as a list by reassigning the accumulator each step.
+fn build(n: int) -> IntList:
+    let acc = Nil
+    let i = 1
+    while i <= n:
+        acc = Cons(i, acc)
+        i = i + 1
+    return acc
+
+# A heap (str) payload, and a wildcard arm that ignores the other variants.
+enum Msg:
+    Text(str)
+    Code(int)
+    Quit
+
+fn render(m: Msg) -> str:
+    match m:
+        Text(s):
+            return "text: " + s
+        _:
+            return "other"
+
+fn main() -> int:
+    print(area(Circle(2)))
+    print(area(Rect(3, 4)))
+    print(area(Nothing))
+
+    print(sum(build(5)))
+
+    print(render(Text("hello")))
+    print(render(Code(7)))
+    print(render(Quit))
+    return 0
