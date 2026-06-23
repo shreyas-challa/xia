@@ -68,6 +68,9 @@ pub struct CodeGen<'ctx> {
     /// Struct definitions and name lookup, copied from the program.
     structs: Vec<StructDef>,
     struct_ids: HashMap<String, u32>,
+    /// Enum definitions, copied from the program. EnumInit/Match nodes carry
+    /// interned ids that index this directly.
+    enums: Vec<EnumDef>,
 }
 
 type CResult<T> = Result<T, String>;
@@ -87,6 +90,7 @@ impl<'ctx> CodeGen<'ctx> {
             str_literals: HashMap::new(),
             structs: Vec::new(),
             struct_ids: HashMap::new(),
+            enums: Vec::new(),
         }
     }
 
@@ -124,6 +128,7 @@ impl<'ctx> CodeGen<'ctx> {
         for (i, s) in self.structs.iter().enumerate() {
             self.struct_ids.insert(s.name.clone(), i as u32);
         }
+        self.enums = program.enums.clone();
         for e in &program.externs {
             self.sigs.insert(e.name.clone(), (true, e.ret));
             self.module
@@ -603,7 +608,107 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 Ok(())
             }
-            Stmt::Match { .. } => Err("codegen: match is not yet implemented".into()),
+            Stmt::Match { scrutinee, arms, .. } => {
+                let Some(Type::Enum(id)) = scrutinee.ty else {
+                    return Err("codegen: match scrutinee is not an enum".into());
+                };
+                let def = self.enums[id as usize].clone();
+                let function = self.current_function();
+                let i64_ty = self.context.i64_type();
+
+                // After ARC a fresh scrutinee is bound to an owned local, so
+                // here the scrutinee is a borrowed value; flush incidental temps.
+                let checkpoint = self.stmt_temps.len();
+                let scrut = self.compile_expr(scrutinee)?.into_pointer_value();
+                self.flush_temps(checkpoint)?;
+                let tag = self
+                    .builder
+                    .build_load(i64_ty, scrut, "tag")
+                    .map_err(err)?
+                    .into_int_value();
+
+                let merge_bb = self.context.append_basic_block(function, "match.end");
+                let mut wildcard_bb = None;
+                let mut cases = Vec::new();
+                let mut plan = Vec::new();
+                for arm in arms {
+                    let bb = self.context.append_basic_block(function, "match.arm");
+                    match &arm.pattern {
+                        Pattern::Wildcard => wildcard_bb = Some(bb),
+                        Pattern::Variant { name, .. } => {
+                            let (vidx, _) = def
+                                .variant(name)
+                                .ok_or_else(|| format!("codegen: unknown variant `{name}`"))?;
+                            cases.push((i64_ty.const_int(vidx as u64, false), bb));
+                        }
+                    }
+                    plan.push((bb, arm));
+                }
+                // The default targets the wildcard arm, or an unreachable trap
+                // when sema proved the match exhaustive.
+                let default_bb = match wildcard_bb {
+                    Some(bb) => bb,
+                    None => self.context.append_basic_block(function, "match.unreachable"),
+                };
+                self.builder
+                    .build_switch(tag, default_bb, &cases)
+                    .map_err(err)?;
+                if wildcard_bb.is_none() {
+                    self.builder.position_at_end(default_bb);
+                    self.builder.build_unreachable().map_err(err)?;
+                }
+
+                let mut any_fallthrough = false;
+                for (bb, arm) in plan {
+                    self.builder.position_at_end(bb);
+                    self.variables.push(HashMap::new());
+                    if let Pattern::Variant { bindings, types, .. } = &arm.pattern {
+                        for (j, (bind, ty)) in bindings.iter().zip(types.iter()).enumerate() {
+                            // Payload field j lives at val + 8 (tag) + j*8.
+                            let off = 8 + (j as u64) * 8;
+                            let src = self.arr_field(&self.builder, scrut, off, "payload.ptr")?;
+                            let v = self
+                                .builder
+                                .build_load(self.basic_type(*ty), src, bind)
+                                .map_err(err)?;
+                            if ty.is_heap() {
+                                // Hand out an owned reference; ARC releases it
+                                // at the arm's end.
+                                self.emit_retain(v.into_pointer_value())?;
+                            }
+                            let dst = self
+                                .builder
+                                .build_alloca(self.basic_type(*ty), bind)
+                                .map_err(err)?;
+                            self.builder.build_store(dst, v).map_err(err)?;
+                            self.variables
+                                .last_mut()
+                                .unwrap()
+                                .insert(bind.clone(), (dst, *ty));
+                        }
+                    }
+                    for stmt in &arm.body {
+                        if self.block_terminated() {
+                            break;
+                        }
+                        self.compile_stmt(stmt)?;
+                    }
+                    self.variables.pop();
+                    if !self.block_terminated() {
+                        any_fallthrough = true;
+                        self.builder
+                            .build_unconditional_branch(merge_bb)
+                            .map_err(err)?;
+                    }
+                }
+
+                self.builder.position_at_end(merge_bb);
+                if !any_fallthrough {
+                    // Every arm left via return/break: nothing reaches the merge.
+                    self.builder.build_unreachable().map_err(err)?;
+                }
+                Ok(())
+            }
             Stmt::Break { .. } => {
                 let (_, after) = *self
                     .loop_stack
@@ -707,9 +812,7 @@ impl<'ctx> CodeGen<'ctx> {
                         format!("codegen: method `{method}` returns no value (line {})", e.span.line)
                     })
             }
-            ExprKind::EnumInit(..) => {
-                Err("codegen: enum construction is not yet implemented".into())
-            }
+            ExprKind::EnumInit(id, vidx, args) => self.compile_enum_init(*id, *vidx, args),
             ExprKind::ArrayLit(elems) => {
                 let Some(elem) = e.ty.and_then(Type::array_elem) else {
                     return Err("codegen: array literal without array type".into());
@@ -1364,6 +1467,130 @@ impl<'ctx> CodeGen<'ctx> {
                     .into_pointer_value();
                 b.build_call(release, &[v.into()], "").map_err(err)?;
             }
+            b.build_return(None).map_err(err)?;
+            Ok(())
+        })
+    }
+
+    /// `Variant(args)` — allocate `[kind][rc][tag][fields...]` sized to this
+    /// variant, store the tag and (retained) payload, and return the value
+    /// pointer (which targets the tag word). The kind word holds the enum's
+    /// drop function when any variant carries heap data, else 0.
+    fn compile_enum_init(
+        &mut self,
+        id: u32,
+        vidx: u32,
+        args: &[Expr],
+    ) -> CResult<BasicValueEnum<'ctx>> {
+        let def = self.enums[id as usize].clone();
+        let variant = def.variants[vidx as usize].clone();
+        let i64_ty = self.context.i64_type();
+        // header + tag word + one word per payload field.
+        let size = HEADER_SIZE as u64 + 8 + variant.fields.len() as u64 * 8;
+        let malloc_ty = self.ptr_ty().fn_type(&[i64_ty.into()], false);
+        let (malloc_ptr, malloc_fnty) = self.libc("malloc", malloc_ty);
+        let block = self
+            .builder
+            .build_indirect_call(
+                malloc_fnty,
+                malloc_ptr,
+                &[i64_ty.const_int(size, false).into()],
+                "block",
+            )
+            .map_err(err)?
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_pointer_value();
+
+        let kind: inkwell::values::IntValue = if def.has_heap_field() {
+            let drop_fn = self.get_or_build_enum_drop(id)?;
+            self.builder
+                .build_ptr_to_int(
+                    drop_fn.as_global_value().as_pointer_value(),
+                    i64_ty,
+                    "drop.addr",
+                )
+                .map_err(err)?
+        } else {
+            i64_ty.const_zero()
+        };
+        self.builder.build_store(block, kind).map_err(err)?;
+        let rc_slot = self.arr_field(&self.builder, block, RC_OFFSET as u64, "rc.slot")?;
+        self.builder
+            .build_store(rc_slot, i64_ty.const_int(1, false))
+            .map_err(err)?;
+        let val = self.arr_field(&self.builder, block, HEADER_SIZE as u64, "val")?;
+        // The tag occupies the first word at the value pointer.
+        self.builder
+            .build_store(val, i64_ty.const_int(vidx as u64, false))
+            .map_err(err)?;
+
+        for (j, (arg, fty)) in args.iter().zip(&variant.fields).enumerate() {
+            let v = self.compile_expr(arg)?;
+            if fty.is_heap() {
+                // The enum owns its own reference to each heap payload field.
+                self.emit_retain(v.into_pointer_value())?;
+            }
+            let slot = self.arr_field(&self.builder, val, 8 + (j as u64) * 8, "payload.slot")?;
+            self.builder.build_store(slot, v).map_err(err)?;
+        }
+        self.stmt_temps.push(val);
+        Ok(val.into())
+    }
+
+    /// `xia_drop_<Enum>(p)`: dispatch on the tag and release the heap payload
+    /// fields of that variant. `xia_release` calls this through the kind word.
+    fn get_or_build_enum_drop(&mut self, id: u32) -> CResult<FunctionValue<'ctx>> {
+        let def = self.enums[id as usize].clone();
+        let fn_name = format!("xia_drop_{}", def.name);
+        let ptr_ty = self.ptr_ty();
+        let ty = self.context.void_type().fn_type(&[ptr_ty.into()], false);
+        let ctx = self.context;
+        let i64_ty = self.context.i64_type();
+        let release = self.get_or_build_release()?;
+        self.build_runtime_fn(&fn_name, ty, |b, f| {
+            let p = f.get_nth_param(0).unwrap().into_pointer_value();
+            let entry = ctx.append_basic_block(f, "entry");
+            let ret = ctx.append_basic_block(f, "ret");
+            b.position_at_end(entry);
+            let tag = b.build_load(i64_ty, p, "tag").map_err(err)?.into_int_value();
+
+            // One case block per variant that owns heap fields; the rest (and
+            // any out-of-range tag) fall straight through to `ret`.
+            let mut cases = Vec::new();
+            let mut blocks = Vec::new();
+            for (vi, variant) in def.variants.iter().enumerate() {
+                if !variant.fields.iter().any(|t| t.is_heap()) {
+                    continue;
+                }
+                let bb = ctx.append_basic_block(f, "drop.variant");
+                cases.push((i64_ty.const_int(vi as u64, false), bb));
+                blocks.push((bb, variant));
+            }
+            b.build_switch(tag, ret, &cases).map_err(err)?;
+
+            for (bb, variant) in blocks {
+                b.position_at_end(bb);
+                for (j, fty) in variant.fields.iter().enumerate() {
+                    if !fty.is_heap() {
+                        continue;
+                    }
+                    let off = i64_ty.const_int((8 + j * 8) as u64, false);
+                    let slot = unsafe {
+                        b.build_gep(ctx.i8_type(), p, &[off], "payload.ptr")
+                            .map_err(err)?
+                    };
+                    let v = b
+                        .build_load(ptr_ty, slot, "payload")
+                        .map_err(err)?
+                        .into_pointer_value();
+                    b.build_call(release, &[v.into()], "").map_err(err)?;
+                }
+                b.build_unconditional_branch(ret).map_err(err)?;
+            }
+
+            b.position_at_end(ret);
             b.build_return(None).map_err(err)?;
             Ok(())
         })
@@ -2654,6 +2881,40 @@ mod tests {
         let ir = compile_to_ir(src).unwrap();
         assert!(ir.contains("call ptr @Tag.shout"));
         assert!(ir.contains("@xia_release"), "owned str result is released");
+    }
+
+    #[test]
+    fn enum_match_lowers_to_a_tag_switch() {
+        // `match` loads the tag word and switches on it; the exhaustive form
+        // (no wildcard) traps the default with `unreachable`.
+        let src = "enum Dir:\n    N\n    S\n    E\n    W\nfn step(d: Dir) -> int:\n    match d:\n        N:\n            return 1\n        S:\n            return -1\n        E:\n            return 2\n        W:\n            return -2\nfn main() -> int:\n    return step(N)\n";
+        let ir = compile_to_ir(src).unwrap();
+        assert!(ir.contains("switch i64"), "match dispatches via a switch");
+        assert!(ir.contains("match.arm"), "arm blocks are emitted");
+        assert!(ir.contains("match.unreachable"), "exhaustive default is unreachable");
+    }
+
+    #[test]
+    fn scalar_enum_uses_zero_kind_and_no_drop_fn() {
+        // An enum whose variants carry no heap data needs no destructor.
+        let src = "enum Light:\n    Red\n    Green\n    Amber\nfn main() -> int:\n    let l = Green\n    match l:\n        Green:\n            return 1\n        _:\n            return 0\n";
+        let ir = compile_to_ir(src).unwrap();
+        assert!(!ir.contains("xia_drop_Light"), "no drop fn for a scalar enum");
+    }
+
+    #[test]
+    fn enum_with_heap_payload_emits_drop_and_balances_arc() {
+        // `Some(str)` owns its payload: construction retains it, the per-enum
+        // drop fn releases it on the matching tag, and the bound value in the
+        // arm is ARC-managed.
+        let src = "enum Msg:\n    Text(str)\n    Quit\nfn render(m: Msg):\n    match m:\n        Text(s):\n            print(s)\n        Quit:\n            print(\"bye\")\nfn main():\n    render(Text(\"hi\"))\n    render(Quit)\n";
+        let ir = compile_to_ir(src).unwrap();
+        assert!(ir.contains("@xia_drop_Msg"), "per-enum drop fn is emitted");
+        // the drop fn dispatches on the tag and releases the str payload
+        assert!(ir.contains("drop.variant"));
+        assert!(ir.contains("call void @xia_release"));
+        // the constructor stashes the drop fn address in the kind word
+        assert!(ir.contains("ptrtoint (ptr @xia_drop_Msg to i64)"));
     }
 
     #[test]
