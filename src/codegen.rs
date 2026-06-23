@@ -98,6 +98,7 @@ impl<'ctx> CodeGen<'ctx> {
             Type::Str => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Array(..) => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Struct(_) => self.context.ptr_type(AddressSpace::default()).into(),
+            Type::Enum(_) => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Unit => unreachable!("unit has no basic type"),
         }
     }
@@ -602,6 +603,7 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 Ok(())
             }
+            Stmt::Match { .. } => Err("codegen: match is not yet implemented".into()),
             Stmt::Break { .. } => {
                 let (_, after) = *self
                     .loop_stack
@@ -704,6 +706,9 @@ impl<'ctx> CodeGen<'ctx> {
                     .ok_or_else(|| {
                         format!("codegen: method `{method}` returns no value (line {})", e.span.line)
                     })
+            }
+            ExprKind::EnumInit(..) => {
+                Err("codegen: enum construction is not yet implemented".into())
             }
             ExprKind::ArrayLit(elems) => {
                 let Some(elem) = e.ty.and_then(Type::array_elem) else {
@@ -843,7 +848,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .builder
                 .build_int_z_extend(v.into_int_value(), i64_ty, "bword")
                 .map_err(err),
-            Type::Str | Type::Struct(_) | Type::Array(..) => self
+            Type::Str | Type::Struct(_) | Type::Enum(_) | Type::Array(..) => self
                 .builder
                 .build_ptr_to_int(v.into_pointer_value(), i64_ty, "pword")
                 .map_err(err),
@@ -868,7 +873,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .build_int_truncate(w, self.context.bool_type(), "bval")
                 .map_err(err)?
                 .into()),
-            Type::Str | Type::Struct(_) | Type::Array(..) => Ok(self
+            Type::Str | Type::Struct(_) | Type::Enum(_) | Type::Array(..) => Ok(self
                 .builder
                 .build_int_to_ptr(w, self.ptr_ty(), "pval")
                 .map_err(err)?
@@ -1380,7 +1385,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(err)?;
                 ("%s\n", sel.into())
             }
-            Type::Array(..) | Type::Struct(_) | Type::Unit => {
+            Type::Array(..) | Type::Struct(_) | Type::Enum(_) | Type::Unit => {
                 return Err("codegen: cannot print this type".into());
             }
         };

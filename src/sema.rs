@@ -411,6 +411,10 @@ impl Analyzer {
                 self.symbols.pop();
                 Ok(())
             }
+            Stmt::Match { line, .. } => Err(SemaError {
+                span: Span::line_only(*line),
+                message: "match is not yet implemented".into(),
+            }),
             Stmt::Break { line } | Stmt::Continue { line } => {
                 if self.loop_depth == 0 {
                     return Err(SemaError {
@@ -782,6 +786,12 @@ impl Analyzer {
                     });
                 }
                 elem_ty
+            }
+            ExprKind::EnumInit(..) => {
+                return Err(SemaError {
+                    span: expr.span,
+                    message: "enum construction is not yet implemented".into(),
+                });
             }
             ExprKind::Field(base, fname) => {
                 let span = expr.span;

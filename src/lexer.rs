@@ -47,6 +47,8 @@ pub enum TokKind {
     Extern,
     #[token("struct")]
     Struct,
+    #[token("enum")]
+    Enum,
     #[token("let")]
     Let,
     #[token("return")]
@@ -59,6 +61,8 @@ pub enum TokKind {
     Else,
     #[token("while")]
     While,
+    #[token("match")]
+    Match,
     #[token("for")]
     For,
     #[token("in")]

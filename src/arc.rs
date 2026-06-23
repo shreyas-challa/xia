@@ -176,6 +176,17 @@ impl ArcInserter {
                     let body = self.process_block_owned(body, ScopeKind::Loop, preowned);
                     out.push(Stmt::ForEach { var, iterable, body, line });
                 }
+                Stmt::Match { scrutinee, arms, line } => {
+                    // Stub: real ARC handling lands in a later stage.
+                    let arms = arms
+                        .into_iter()
+                        .map(|arm| MatchArm {
+                            pattern: arm.pattern,
+                            body: self.process_block(arm.body, ScopeKind::Block),
+                        })
+                        .collect();
+                    out.push(Stmt::Match { scrutinee, arms, line });
+                }
                 other @ (Stmt::Assign { .. }
                 | Stmt::IndexAssign { .. }
                 | Stmt::FieldAssign { .. }

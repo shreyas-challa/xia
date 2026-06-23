@@ -49,6 +49,9 @@ pub struct Parser {
     /// Struct name -> interned id, collected by a pre-scan so a struct can
     /// be referenced before its declaration.
     struct_ids: HashMap<String, u32>,
+    /// Enum name -> interned id, collected by the same pre-scan so an enum
+    /// type can be named before its declaration.
+    enum_ids: HashMap<String, u32>,
 }
 
 type PResult<T> = Result<T, ParseError>;
@@ -56,16 +59,21 @@ type PResult<T> = Result<T, ParseError>;
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
         let mut struct_ids = HashMap::new();
+        let mut enum_ids = HashMap::new();
         for pair in tokens.windows(2) {
-            if pair[0].kind == TokKind::Struct {
-                if let TokKind::Ident(name) = &pair[1].kind {
-                    if !struct_ids.contains_key(name) {
+            if let TokKind::Ident(name) = &pair[1].kind {
+                match pair[0].kind {
+                    TokKind::Struct if !struct_ids.contains_key(name) => {
                         struct_ids.insert(name.clone(), struct_ids.len() as u32);
                     }
+                    TokKind::Enum if !enum_ids.contains_key(name) => {
+                        enum_ids.insert(name.clone(), enum_ids.len() as u32);
+                    }
+                    _ => {}
                 }
             }
         }
-        Parser { tokens, pos: 0, struct_ids }
+        Parser { tokens, pos: 0, struct_ids, enum_ids }
     }
 
     fn peek(&self) -> &TokKind {
@@ -141,9 +149,21 @@ impl Parser {
                     );
                     program.structs.push(def);
                 }
+                TokKind::Enum => {
+                    let def = self.parse_enum()?;
+                    if program.enums.iter().any(|e| e.name == def.name) {
+                        return Err(self.error(format!("duplicate enum `{}`", def.name)));
+                    }
+                    debug_assert_eq!(
+                        self.enum_ids[&def.name] as usize,
+                        program.enums.len(),
+                        "enum ids must match declaration order"
+                    );
+                    program.enums.push(def);
+                }
                 other => {
                     return Err(self.error(format!(
-                        "expected `fn`, `struct` or `extern` at top level, found {other}"
+                        "expected `fn`, `struct`, `enum` or `extern` at top level, found {other}"
                     )));
                 }
             }
@@ -168,7 +188,10 @@ impl Parser {
             "str" => Ok(Type::Str),
             other => match self.struct_ids.get(other) {
                 Some(id) => Ok(Type::Struct(*id)),
-                None => Err(self.error(format!("unknown type `{other}`"))),
+                None => match self.enum_ids.get(other) {
+                    Some(id) => Ok(Type::Enum(*id)),
+                    None => Err(self.error(format!("unknown type `{other}`"))),
+                },
             },
         }
     }
@@ -196,6 +219,44 @@ impl Parser {
             return Err(self.error(format!("struct `{name}` must have at least one field")));
         }
         Ok(StructDef { name, fields, line })
+    }
+
+    /// `enum Name:` NEWLINE INDENT (`Variant` | `Variant(type, ...)` NEWLINE)+ DEDENT
+    fn parse_enum(&mut self) -> PResult<EnumDef> {
+        let line = self.line();
+        self.expect(TokKind::Enum)?;
+        let name = self.expect_ident()?;
+        self.expect(TokKind::Colon)?;
+        self.expect(TokKind::Newline)?;
+        self.expect(TokKind::Indent)?;
+        let mut variants: Vec<Variant> = Vec::new();
+        while !self.check(&TokKind::Dedent) {
+            let vname = self.expect_ident()?;
+            if variants.iter().any(|v| v.name == vname) {
+                return Err(self.error(format!("duplicate variant `{vname}` in `{name}`")));
+            }
+            let mut fields = Vec::new();
+            if self.check(&TokKind::LParen) {
+                while !self.check(&TokKind::RParen) {
+                    fields.push(self.parse_type()?);
+                    if !self.check(&TokKind::Comma) {
+                        self.expect(TokKind::RParen)?;
+                        break;
+                    }
+                }
+                if fields.is_empty() {
+                    return Err(self.error(format!(
+                        "variant `{vname}` has empty `()`; drop the parentheses for a unit variant"
+                    )));
+                }
+            }
+            self.expect(TokKind::Newline)?;
+            variants.push(Variant { name: vname, fields });
+        }
+        if variants.is_empty() {
+            return Err(self.error(format!("enum `{name}` must have at least one variant")));
+        }
+        Ok(EnumDef { name, variants, line })
     }
 
     fn parse_return_type(&mut self) -> PResult<Type> {
@@ -338,6 +399,7 @@ impl Parser {
                 Ok(Stmt::Continue { line })
             }
             TokKind::If => self.parse_if(),
+            TokKind::Match => self.parse_match(),
             TokKind::For => self.parse_for(),
             TokKind::While => {
                 self.advance();
@@ -416,6 +478,47 @@ impl Parser {
             }
         }
         Ok(Stmt::ForEach { var, iterable, body, line })
+    }
+
+    /// `match scrutinee:` NEWLINE INDENT (`pattern ":" block`)+ DEDENT, where
+    /// `pattern` is `_`, a bare `Variant`, or `Variant(a, b, ...)` binding the
+    /// payload positionally.
+    fn parse_match(&mut self) -> PResult<Stmt> {
+        let line = self.line();
+        self.expect(TokKind::Match)?;
+        let scrutinee = self.parse_expression()?;
+        self.expect(TokKind::Colon)?;
+        self.expect(TokKind::Newline)?;
+        self.expect(TokKind::Indent)?;
+        let mut arms = Vec::new();
+        while !self.check(&TokKind::Dedent) {
+            if self.peek() == &TokKind::Eof {
+                return Err(self.error("unexpected end of file inside match".into()));
+            }
+            let name = self.expect_ident()?;
+            let pattern = if name == "_" {
+                Pattern::Wildcard
+            } else {
+                let mut bindings = Vec::new();
+                if self.check(&TokKind::LParen) {
+                    while !self.check(&TokKind::RParen) {
+                        bindings.push(self.expect_ident()?);
+                        if !self.check(&TokKind::Comma) {
+                            self.expect(TokKind::RParen)?;
+                            break;
+                        }
+                    }
+                }
+                Pattern::Variant { name, bindings, types: Vec::new() }
+            };
+            self.expect(TokKind::Colon)?;
+            let body = self.parse_block()?;
+            arms.push(MatchArm { pattern, body });
+        }
+        if arms.is_empty() {
+            return Err(self.error("match must have at least one arm".into()));
+        }
+        Ok(Stmt::Match { scrutinee, arms, line })
     }
 
     /// `elif` chains desugar to nested if/else.
@@ -994,6 +1097,56 @@ mod tests {
         assert!(parse("struct P:\n    x: int\n    x: int\n").is_err(), "dup field");
         assert!(parse("struct P:\n    x: int\nstruct P:\n    y: int\n").is_err(), "dup struct");
         assert!(parse("fn f(p: Nope) -> int:\n    return 0\n").is_err(), "unknown type");
+    }
+
+    #[test]
+    fn parses_enum_decl_with_payloads() {
+        let src = "enum Shape:\n    Circle(float)\n    Rect(float, float)\n    Empty\n";
+        let prog = parse(src).unwrap();
+        assert_eq!(prog.enums.len(), 1);
+        let e = &prog.enums[0];
+        assert_eq!(e.name, "Shape");
+        assert_eq!(e.variants.len(), 3);
+        assert_eq!(e.variants[0].name, "Circle");
+        assert_eq!(e.variants[0].fields, vec![Type::Float]);
+        assert_eq!(e.variants[1].fields, vec![Type::Float, Type::Float]);
+        assert!(e.variants[2].fields.is_empty(), "unit variant has no payload");
+    }
+
+    #[test]
+    fn enum_types_resolve_in_any_order() {
+        // An enum can be named as a type before its declaration.
+        let src = "fn f(s: Shape) -> int:\n    return 0\nenum Shape:\n    A\n    B\n";
+        let prog = parse(src).unwrap();
+        assert_eq!(prog.functions[0].params[0].ty, Type::Enum(0));
+    }
+
+    #[test]
+    fn parses_match_with_variant_and_wildcard_arms() {
+        let src = "enum Opt:\n    Some(int)\n    None\nfn f(o: Opt) -> int:\n    match o:\n        Some(n):\n            return n\n        _:\n            return 0\n";
+        let prog = parse(src).unwrap();
+        let Stmt::Match { scrutinee, arms, .. } = &prog.functions[0].body[0] else {
+            panic!("expected match, got {:?}", prog.functions[0].body[0]);
+        };
+        assert!(matches!(&scrutinee.kind, ExprKind::Var(v) if v == "o"));
+        assert_eq!(arms.len(), 2);
+        let Pattern::Variant { name, bindings, .. } = &arms[0].pattern else {
+            panic!("expected variant pattern");
+        };
+        assert_eq!(name, "Some");
+        assert_eq!(bindings, &vec!["n".to_string()]);
+        assert!(matches!(arms[1].pattern, Pattern::Wildcard));
+    }
+
+    #[test]
+    fn enum_parse_errors() {
+        assert!(parse("enum E:\n    A\n    A\n").is_err(), "dup variant");
+        assert!(parse("enum E:\nfn main():\n    return\n").is_err(), "no variants");
+        assert!(parse("enum E:\n    A()\n").is_err(), "empty payload parens");
+        assert!(
+            parse("enum E:\n    A\nenum E:\n    B\n").is_err(),
+            "dup enum"
+        );
     }
 
     #[test]

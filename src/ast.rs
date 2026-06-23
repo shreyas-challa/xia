@@ -14,6 +14,8 @@ pub enum ElemType {
     Str,
     /// Interned struct id — an index into `Program::structs`.
     Struct(u32),
+    /// Interned enum id — an index into `Program::enums`.
+    Enum(u32),
 }
 
 impl ElemType {
@@ -24,6 +26,7 @@ impl ElemType {
             ElemType::Bool => Type::Bool,
             ElemType::Str => Type::Str,
             ElemType::Struct(id) => Type::Struct(id),
+            ElemType::Enum(id) => Type::Enum(id),
         }
     }
 
@@ -35,6 +38,7 @@ impl ElemType {
             Type::Bool => Some(ElemType::Bool),
             Type::Str => Some(ElemType::Str),
             Type::Struct(id) => Some(ElemType::Struct(id)),
+            Type::Enum(id) => Some(ElemType::Enum(id)),
             Type::Array(..) | Type::Unit => None,
         }
     }
@@ -52,6 +56,9 @@ pub enum Type {
     Array(ElemType, u8),
     /// A user-defined struct, by interned id (index into `Program::structs`).
     Struct(u32),
+    /// A user-defined enum (tagged union), by interned id (index into
+    /// `Program::enums`).
+    Enum(u32),
     /// The "no value" type of statements and functions without `-> T`.
     Unit,
 }
@@ -59,7 +66,10 @@ pub enum Type {
 impl Type {
     /// Heap-allocated, reference-counted types managed by ARC.
     pub fn is_heap(self) -> bool {
-        matches!(self, Type::Str | Type::Array(..) | Type::Struct(_))
+        matches!(
+            self,
+            Type::Str | Type::Array(..) | Type::Struct(_) | Type::Enum(_)
+        )
     }
 
     /// The element type produced by indexing an array once. `[[int]]` yields
@@ -101,6 +111,7 @@ impl std::fmt::Display for Type {
                 Ok(())
             }
             Type::Struct(id) => write!(f, "struct#{id}"),
+            Type::Enum(id) => write!(f, "enum#{id}"),
             Type::Unit => write!(f, "unit"),
         }
     }
@@ -156,6 +167,10 @@ pub enum ExprKind {
     /// `receiver.method(args)` — a struct method call. Lowered to a direct
     /// call passing the receiver as an implicit first argument.
     MethodCall(Box<Expr>, String, Vec<Expr>),
+    /// An enum variant constructor `Variant(args)` / nullary `Variant`,
+    /// resolved by sema from a `Call` / `Var` into `(enum id, variant index,
+    /// payload args)`. The parser never produces this directly.
+    EnumInit(u32, u32, Vec<Expr>),
     /// `[e1, e2, ...]` — an empty literal needs a type annotation.
     ArrayLit(Vec<Expr>),
     /// `base[index]`
@@ -205,6 +220,13 @@ pub enum Stmt {
         cond: Expr,
         body: Block,
     },
+    /// `match scrutinee:` followed by indented `pattern: block` arms. The
+    /// scrutinee must be an enum; arms dispatch on its variant.
+    Match {
+        scrutinee: Expr,
+        arms: Vec<MatchArm>,
+        line: usize,
+    },
     /// `for var in range(start, end):` — counts from `start` (inclusive) to
     /// `end` (exclusive). `continue` jumps to the increment, not the test.
     For {
@@ -234,6 +256,27 @@ pub enum Stmt {
 }
 
 pub type Block = Vec<Stmt>;
+
+/// One `pattern: block` arm of a `match`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Block,
+}
+
+/// A `match` arm pattern. `_` is the catch-all; a variant pattern binds the
+/// payload positionally (`Some(x)`, `Pair(a, b)`, or a bare `None`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    Wildcard,
+    Variant {
+        name: String,
+        bindings: Vec<String>,
+        /// The payload types, filled in by semantic analysis (empty out of the
+        /// parser). ARC and codegen read these to bind and release the payload.
+        types: Vec<Type>,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
@@ -291,9 +334,45 @@ impl StructDef {
     }
 }
 
+/// `enum Name:` followed by indented variant lines, each `Variant` or
+/// `Variant(type, ...)`. Enums are heap-allocated tagged unions: a value
+/// carries a tag word and that variant's payload, reference-counted like a
+/// struct.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumDef {
+    pub name: String,
+    pub variants: Vec<Variant>,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Variant {
+    pub name: String,
+    /// Positional payload types; empty for a unit variant.
+    pub fields: Vec<Type>,
+}
+
+impl EnumDef {
+    pub fn variant(&self, name: &str) -> Option<(usize, &Variant)> {
+        self.variants
+            .iter()
+            .position(|v| v.name == name)
+            .map(|i| (i, &self.variants[i]))
+    }
+
+    /// Does any variant carry a heap-typed payload field? Such enums need a
+    /// generated destructor; scalar-only enums use kind 0.
+    pub fn has_heap_field(&self) -> bool {
+        self.variants
+            .iter()
+            .any(|v| v.fields.iter().any(|t| t.is_heap()))
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Program {
     pub externs: Vec<ExternFn>,
     pub functions: Vec<Function>,
     pub structs: Vec<StructDef>,
+    pub enums: Vec<EnumDef>,
 }
