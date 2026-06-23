@@ -71,6 +71,11 @@ pub struct Analyzer {
     methods: HashMap<(u32, String), FnSig>,
     structs: Vec<StructDef>,
     struct_ids: HashMap<String, u32>,
+    enums: Vec<EnumDef>,
+    enum_ids: HashMap<String, u32>,
+    /// Variant name -> (enum id, variant index). Variant names are global and
+    /// unique, so a bare `Some(x)` / `None` resolves without qualification.
+    variants: HashMap<String, (u32, u32)>,
     symbols: SymbolTable,
     current_ret: Type,
     loop_depth: usize,
@@ -85,16 +90,20 @@ impl Analyzer {
             methods: HashMap::new(),
             structs: Vec::new(),
             struct_ids: HashMap::new(),
+            enums: Vec::new(),
+            enum_ids: HashMap::new(),
+            variants: HashMap::new(),
             symbols: SymbolTable::new(),
             current_ret: Type::Unit,
             loop_depth: 0,
         }
     }
 
-    /// Resolve a type to a user-facing name (struct ids -> struct names).
+    /// Resolve a type to a user-facing name (struct/enum ids -> their names).
     fn type_name(&self, t: Type) -> String {
         match t {
             Type::Struct(id) => self.structs[id as usize].name.clone(),
+            Type::Enum(id) => self.enums[id as usize].name.clone(),
             Type::Array(..) => format!("[{}]", self.type_name(t.array_elem().unwrap())),
             other => other.to_string(),
         }
@@ -110,6 +119,46 @@ impl Analyzer {
                     span: Span::line_only(s.line),
                     message: format!("struct `{}` collides with a builtin", s.name),
                 });
+            }
+        }
+        self.enums = program.enums.clone();
+        for (i, e) in self.enums.iter().enumerate() {
+            if BUILTINS.contains(&e.name.as_str()) {
+                return Err(SemaError {
+                    span: Span::line_only(e.line),
+                    message: format!("enum `{}` collides with a builtin", e.name),
+                });
+            }
+            if self.struct_ids.contains_key(&e.name) {
+                return Err(SemaError {
+                    span: Span::line_only(e.line),
+                    message: format!("`{}` is declared as both a struct and an enum", e.name),
+                });
+            }
+            self.enum_ids.insert(e.name.clone(), i as u32);
+        }
+        // Variant names are global and unique; they must not collide with a
+        // builtin, struct constructor, or another variant.
+        for (i, e) in self.enums.iter().enumerate() {
+            for (j, v) in e.variants.iter().enumerate() {
+                if BUILTINS.contains(&v.name.as_str()) || self.struct_ids.contains_key(&v.name) {
+                    return Err(SemaError {
+                        span: Span::line_only(e.line),
+                        message: format!(
+                            "variant `{}` collides with a builtin or struct of the same name",
+                            v.name
+                        ),
+                    });
+                }
+                if self.variants.insert(v.name.clone(), (i as u32, j as u32)).is_some() {
+                    return Err(SemaError {
+                        span: Span::line_only(e.line),
+                        message: format!(
+                            "variant `{}` is defined in more than one enum (names are global)",
+                            v.name
+                        ),
+                    });
+                }
             }
         }
         // Register every signature first so call order doesn't matter.
@@ -166,6 +215,12 @@ impl Analyzer {
                 return Err(SemaError {
                     span: Span::line_only(f.line),
                     message: format!("`{}` is defined as both a struct and a function", f.name),
+                });
+            }
+            if self.enum_ids.contains_key(&f.name) || self.variants.contains_key(&f.name) {
+                return Err(SemaError {
+                    span: Span::line_only(f.line),
+                    message: format!("`{}` collides with an enum or variant of the same name", f.name),
                 });
             }
         }
@@ -411,10 +466,95 @@ impl Analyzer {
                 self.symbols.pop();
                 Ok(())
             }
-            Stmt::Match { line, .. } => Err(SemaError {
-                span: Span::line_only(*line),
-                message: "match is not yet implemented".into(),
-            }),
+            Stmt::Match { scrutinee, arms, line } => {
+                let sty = self.check_expr(scrutinee)?;
+                let Type::Enum(id) = sty else {
+                    return Err(SemaError {
+                        span: scrutinee.span,
+                        message: format!(
+                            "match scrutinee must be an enum, found {}",
+                            self.type_name(sty)
+                        ),
+                    });
+                };
+                let def = self.enums[id as usize].clone();
+                let mut covered = vec![false; def.variants.len()];
+                let mut has_wildcard = false;
+                for arm in arms.iter_mut() {
+                    match &mut arm.pattern {
+                        Pattern::Wildcard => {
+                            if has_wildcard {
+                                return Err(SemaError {
+                                    span: Span::line_only(*line),
+                                    message: "duplicate `_` arm in match".into(),
+                                });
+                            }
+                            has_wildcard = true;
+                            self.check_block(&mut arm.body)?;
+                        }
+                        Pattern::Variant { name, bindings, types } => {
+                            let Some((vidx, fields)) =
+                                def.variant(name).map(|(i, v)| (i, v.fields.clone()))
+                            else {
+                                return Err(SemaError {
+                                    span: Span::line_only(*line),
+                                    message: format!("`{}` has no variant `{name}`", def.name),
+                                });
+                            };
+                            if covered[vidx] {
+                                return Err(SemaError {
+                                    span: Span::line_only(*line),
+                                    message: format!("duplicate match arm for variant `{name}`"),
+                                });
+                            }
+                            covered[vidx] = true;
+                            if bindings.len() != fields.len() {
+                                return Err(SemaError {
+                                    span: Span::line_only(*line),
+                                    message: format!(
+                                        "variant `{name}` binds {} value(s) but carries {} field(s)",
+                                        bindings.len(),
+                                        fields.len()
+                                    ),
+                                });
+                            }
+                            *types = fields.clone();
+                            self.symbols.push();
+                            for (b, t) in bindings.iter().zip(fields.iter()) {
+                                if !self.symbols.declare(b, *t) {
+                                    self.symbols.pop();
+                                    return Err(SemaError {
+                                        span: Span::line_only(*line),
+                                        message: format!("duplicate binding `{b}` in pattern"),
+                                    });
+                                }
+                            }
+                            let r = self.check_block(&mut arm.body);
+                            self.symbols.pop();
+                            r?;
+                        }
+                    }
+                }
+                if !has_wildcard {
+                    let missing: Vec<String> = covered
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| !**c)
+                        .map(|(i, _)| def.variants[i].name.clone())
+                        .collect();
+                    if !missing.is_empty() {
+                        return Err(SemaError {
+                            span: Span::line_only(*line),
+                            message: format!(
+                                "non-exhaustive match on `{}`: missing {} (add the variant(s) or a `_` arm)",
+                                def.name,
+                                missing.join(", ")
+                            ),
+                        });
+                    }
+                }
+                Ok(())
+            }
             Stmt::Break { line } | Stmt::Continue { line } => {
                 if self.loop_depth == 0 {
                     return Err(SemaError {
@@ -428,7 +568,57 @@ impl Analyzer {
         }
     }
 
+    /// A `Call` or `Var` whose name is a known enum variant is an enum
+    /// constructor. Rewrite it to `EnumInit`, type-checking the payload, and
+    /// return the enum type; otherwise leave it alone.
+    fn try_enum_init(&mut self, expr: &mut Expr) -> SResult<Option<Type>> {
+        let name = match &expr.kind {
+            ExprKind::Call(n, _) => n.clone(),
+            // A plain identifier is a nullary variant only if it isn't a local.
+            ExprKind::Var(n) if self.symbols.lookup(n).is_none() => n.clone(),
+            _ => return Ok(None),
+        };
+        let Some(&(eid, vidx)) = self.variants.get(&name) else {
+            return Ok(None);
+        };
+        let span = expr.span;
+        let mut args = match &mut expr.kind {
+            ExprKind::Call(_, a) => std::mem::take(a),
+            _ => Vec::new(),
+        };
+        let fields = self.enums[eid as usize].variants[vidx as usize].fields.clone();
+        if args.len() != fields.len() {
+            return Err(SemaError {
+                span,
+                message: format!(
+                    "variant `{name}` takes {} payload value(s), got {}",
+                    fields.len(),
+                    args.len()
+                ),
+            });
+        }
+        for (arg, fty) in args.iter_mut().zip(fields.iter()) {
+            let at = self.check_expr(arg)?;
+            if at != *fty {
+                return Err(SemaError {
+                    span: arg.span,
+                    message: format!(
+                        "payload of `{name}`: expected {}, found {}",
+                        self.type_name(*fty),
+                        self.type_name(at)
+                    ),
+                });
+            }
+        }
+        expr.kind = ExprKind::EnumInit(eid, vidx, args);
+        Ok(Some(Type::Enum(eid)))
+    }
+
     fn check_expr(&mut self, expr: &mut Expr) -> SResult<Type> {
+        if let Some(ty) = self.try_enum_init(expr)? {
+            expr.ty = Some(ty);
+            return Ok(ty);
+        }
         let ty = match &mut expr.kind {
             ExprKind::Int(_) => Type::Int,
             ExprKind::Float(_) => Type::Float,
@@ -481,7 +671,9 @@ impl Analyzer {
                         }
                     }
                     BinOp::Eq | BinOp::Ne => {
-                        if lt == Type::Unit || matches!(lt, Type::Array(..) | Type::Struct(_)) {
+                        if lt == Type::Unit
+                            || matches!(lt, Type::Array(..) | Type::Struct(_) | Type::Enum(_))
+                        {
                             return Err(SemaError {
                                 span,
                                 message: format!("cannot compare values of type {}", self.type_name(lt)),
@@ -522,7 +714,9 @@ impl Analyzer {
                         });
                     }
                     let t = self.check_expr(&mut args[0])?;
-                    if t == Type::Unit || matches!(t, Type::Array(..) | Type::Struct(_)) {
+                    if t == Type::Unit
+                        || matches!(t, Type::Array(..) | Type::Struct(_) | Type::Enum(_))
+                    {
                         return Err(SemaError {
                             span,
                             message: format!("cannot print a value of type {}", self.type_name(t)),
@@ -537,7 +731,9 @@ impl Analyzer {
                         });
                     }
                     let t = self.check_expr(&mut args[0])?;
-                    if t == Type::Unit || matches!(t, Type::Array(..) | Type::Struct(_)) {
+                    if t == Type::Unit
+                        || matches!(t, Type::Array(..) | Type::Struct(_) | Type::Enum(_))
+                    {
                         return Err(SemaError {
                             span,
                             message: format!("cannot convert a value of type {} to str", self.type_name(t)),
@@ -787,12 +983,9 @@ impl Analyzer {
                 }
                 elem_ty
             }
-            ExprKind::EnumInit(..) => {
-                return Err(SemaError {
-                    span: expr.span,
-                    message: "enum construction is not yet implemented".into(),
-                });
-            }
+            // Already rewritten by `try_enum_init` (e.g. on a re-check); its
+            // payload was validated when it was produced.
+            ExprKind::EnumInit(eid, _, _) => Type::Enum(*eid),
             ExprKind::Field(base, fname) => {
                 let span = expr.span;
                 let bt = self.check_expr(base)?;
@@ -1128,6 +1321,113 @@ mod tests {
         assert!(
             analyze("fn (x: int) f() -> int:\n    return x\nfn main():\n    return\n").is_err(),
             "non-struct receiver rejected by sema"
+        );
+    }
+
+    #[test]
+    fn enum_construction_and_match_type_check() {
+        let src = "enum Opt:\n    Some(int)\n    None\nfn unwrap(o: Opt) -> int:\n    match o:\n        Some(n):\n            return n\n        None:\n            return -1\nfn main() -> int:\n    return unwrap(Some(7)) + unwrap(None)\n";
+        let prog = analyze(src).unwrap();
+        // `Some(7)` is rewritten to an EnumInit with the enum's type.
+        let Stmt::Return { value: Some(e), .. } = &prog.functions[1].body[0] else {
+            panic!("expected return");
+        };
+        let ExprKind::Binary(lhs, _, _) = &e.kind else { panic!() };
+        let ExprKind::Call(_, args) = &lhs.kind else { panic!("expected call to unwrap") };
+        assert!(matches!(&args[0].kind, ExprKind::EnumInit(_, _, a) if a.len() == 1));
+        assert_eq!(args[0].ty, Some(Type::Enum(0)));
+    }
+
+    #[test]
+    fn match_arm_bindings_have_payload_types() {
+        // The binding `n` from `Some(n)` is an int inside the arm.
+        let src = "enum Box:\n    Val(str)\n    Empty\nfn show(b: Box):\n    match b:\n        Val(s):\n            print(s + \"!\")\n        Empty:\n            print(\"empty\")\nfn main():\n    return\n";
+        assert!(analyze(src).is_ok());
+        // wrong use of the binding's type is rejected
+        let bad = "enum Box:\n    Val(str)\n    Empty\nfn f(b: Box):\n    match b:\n        Val(s):\n            print(s + 1)\n        Empty:\n            return\nfn main():\n    return\n";
+        assert!(analyze(bad).is_err(), "binding s is a str, not int");
+    }
+
+    #[test]
+    fn match_must_be_exhaustive_or_have_wildcard() {
+        let missing = "enum E:\n    A\n    B\n    C\nfn f(e: E) -> int:\n    match e:\n        A:\n            return 1\n        B:\n            return 2\n";
+        assert!(analyze(missing).is_err(), "C is not covered");
+        let wild = "enum E:\n    A\n    B\n    C\nfn f(e: E) -> int:\n    match e:\n        A:\n            return 1\n        _:\n            return 0\n";
+        assert!(analyze(wild).is_ok(), "wildcard makes it exhaustive");
+        let full = "enum E:\n    A\n    B\nfn f(e: E) -> int:\n    match e:\n        A:\n            return 1\n        B:\n            return 2\n";
+        assert!(analyze(full).is_ok());
+    }
+
+    #[test]
+    fn match_rejects_bad_arms() {
+        // unknown variant
+        assert!(
+            analyze("enum E:\n    A\n    B\nfn f(e: E):\n    match e:\n        A:\n            return\n        Z:\n            return\n").is_err(),
+            "unknown variant Z"
+        );
+        // duplicate arm
+        assert!(
+            analyze("enum E:\n    A\n    B\nfn f(e: E):\n    match e:\n        A:\n            return\n        A:\n            return\n        B:\n            return\n").is_err(),
+            "duplicate A"
+        );
+        // wrong binding arity
+        assert!(
+            analyze("enum E:\n    Pair(int, int)\nfn f(e: E):\n    match e:\n        Pair(a):\n            return\n").is_err(),
+            "Pair carries two fields"
+        );
+        // match on a non-enum
+        assert!(
+            analyze("fn main():\n    let x = 5\n    match x:\n        A:\n            return\n").is_err(),
+            "scrutinee must be an enum"
+        );
+    }
+
+    #[test]
+    fn enum_constructor_payload_is_checked() {
+        // wrong payload arity
+        assert!(
+            analyze("enum Opt:\n    Some(int)\n    None\nfn main():\n    let o = Some()\n").is_err(),
+            "Some needs one value"
+        );
+        // wrong payload type
+        assert!(
+            analyze("enum Opt:\n    Some(int)\n    None\nfn main():\n    let o = Some(true)\n").is_err(),
+            "Some takes an int"
+        );
+        // nullary variant used as a value
+        assert!(
+            analyze("enum Opt:\n    Some(int)\n    None\nfn use(o: Opt) -> int:\n    return 0\nfn main() -> int:\n    return use(None)\n").is_ok()
+        );
+    }
+
+    #[test]
+    fn enum_and_variant_names_must_not_collide() {
+        // two enums sharing a variant name
+        assert!(
+            analyze("enum A:\n    X\n    Y\nenum B:\n    X\n    Z\nfn main():\n    return\n").is_err(),
+            "variant X defined twice"
+        );
+        // enum name colliding with a struct
+        assert!(
+            analyze("struct P:\n    x: int\nenum P:\n    A\nfn main():\n    return\n").is_err(),
+            "P is both a struct and an enum"
+        );
+        // variant colliding with a struct constructor
+        assert!(
+            analyze("struct Pair:\n    a: int\nenum E:\n    Pair(int)\n    Empty\nfn main():\n    return\n").is_err(),
+            "variant Pair collides with struct Pair"
+        );
+    }
+
+    #[test]
+    fn enums_not_printable_or_comparable() {
+        assert!(
+            analyze("enum E:\n    A\n    B\nfn f(e: E):\n    print(e)\n").is_err(),
+            "enum not printable"
+        );
+        assert!(
+            analyze("enum E:\n    A\n    B\nfn f(a: E, b: E) -> bool:\n    return a == b\n").is_err(),
+            "enum not comparable"
         );
     }
 
