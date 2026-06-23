@@ -177,12 +177,46 @@ impl ArcInserter {
                     out.push(Stmt::ForEach { var, iterable, body, line });
                 }
                 Stmt::Match { scrutinee, arms, line } => {
-                    // Stub: real ARC handling lands in a later stage.
+                    // A fresh (+1) scrutinee is bound to an owned local so it is
+                    // released on every exit path — fall-through past the match
+                    // or an arm's return/break. A plain `Var` is borrowed from
+                    // its owner and left alone.
+                    let scrutinee = if matches!(scrutinee.kind, ExprKind::Var(_)) {
+                        scrutinee
+                    } else {
+                        let tmp = self.fresh_tmp();
+                        let ty = scrutinee.ty;
+                        let span = scrutinee.span;
+                        out.push(Stmt::Let {
+                            name: tmp.clone(),
+                            ty,
+                            value: scrutinee,
+                            line,
+                        });
+                        if ty.map(Type::is_heap).unwrap_or(false) {
+                            self.scopes.last_mut().unwrap().owned.push(tmp.clone());
+                        }
+                        let mut v = Expr::new(ExprKind::Var(tmp), span);
+                        v.ty = ty;
+                        v
+                    };
+                    // Heap payload bindings arrive retained (+1), like a foreach
+                    // element, so each arm owns and releases them.
                     let arms = arms
                         .into_iter()
-                        .map(|arm| MatchArm {
-                            pattern: arm.pattern,
-                            body: self.process_block(arm.body, ScopeKind::Block),
+                        .map(|arm| {
+                            let preowned = match &arm.pattern {
+                                Pattern::Variant { bindings, types, .. } => bindings
+                                    .iter()
+                                    .zip(types.iter())
+                                    .filter(|(_, t)| t.is_heap())
+                                    .map(|(b, _)| b.clone())
+                                    .collect(),
+                                Pattern::Wildcard => Vec::new(),
+                            };
+                            let body =
+                                self.process_block_owned(arm.body, ScopeKind::Block, preowned);
+                            MatchArm { pattern: arm.pattern, body }
                         })
                         .collect();
                     out.push(Stmt::Match { scrutinee, arms, line });
@@ -293,6 +327,11 @@ mod tests {
                 Stmt::While { body, .. }
                 | Stmt::For { body, .. }
                 | Stmt::ForEach { body, .. } => count(body, retain, release),
+                Stmt::Match { arms, .. } => {
+                    for arm in arms {
+                        count(&arm.body, retain, release);
+                    }
+                }
                 _ => {}
             }
         }
@@ -403,6 +442,59 @@ mod tests {
             panic!("expected foreach");
         };
         assert!(!matches!(body.last().unwrap(), Stmt::Release(_)));
+    }
+
+    #[test]
+    fn match_heap_binding_released_at_arm_end() {
+        // The str payload bound by `Val(s)` is owned by the arm and released at
+        // its end; the scalar arm has nothing to release.
+        let src = "enum Box:\n    Val(str)\n    Empty\nfn f(b: Box):\n    match b:\n        Val(s):\n            print(s)\n        Empty:\n            print(\"e\")\n";
+        let prog = lower(src);
+        let f = &prog.functions[0];
+        let Some(Stmt::Match { arms, .. }) =
+            f.body.iter().find(|s| matches!(s, Stmt::Match { .. }))
+        else {
+            panic!("expected a match statement");
+        };
+        assert!(matches!(&arms[0].pattern, Pattern::Variant { .. }));
+        assert!(
+            matches!(arms[0].body.last().unwrap(), Stmt::Release(n) if n == "s"),
+            "heap binding released at arm end"
+        );
+        assert!(
+            !matches!(arms[1].body.last().unwrap(), Stmt::Release(_)),
+            "scalar arm has nothing to release"
+        );
+    }
+
+    #[test]
+    fn match_on_fresh_scrutinee_binds_owned_temp() {
+        // `match make():` over a fresh enum value binds it to an owned temp so
+        // the value is released after the match.
+        let src = "enum E:\n    A\n    B\nfn make() -> E:\n    return A\nfn main():\n    match make():\n        A:\n            print(\"a\")\n        B:\n            print(\"b\")\n";
+        let prog = lower(src);
+        let main = prog.functions.iter().find(|f| f.name == "main").unwrap();
+        // a $arc temp let precedes the match, and is released at scope end
+        assert!(
+            matches!(&main.body[0], Stmt::Let { name, .. } if name.starts_with("$arc")),
+            "fresh scrutinee bound to a temp"
+        );
+        assert!(
+            matches!(main.body.last().unwrap(), Stmt::Release(n) if n.starts_with("$arc")),
+            "temp scrutinee released after the match"
+        );
+    }
+
+    #[test]
+    fn match_on_var_scrutinee_borrows() {
+        // A plain variable scrutinee is borrowed: no temp binding, no extra
+        // release of the scrutinee itself.
+        let src = "enum E:\n    A\n    B\nfn f(e: E):\n    match e:\n        A:\n            print(\"a\")\n        B:\n            print(\"b\")\n";
+        let prog = lower(src);
+        let f = &prog.functions[0];
+        // first statement is the param retain, then the match directly
+        assert!(matches!(&f.body[0], Stmt::Retain(n) if n == "e"));
+        assert!(matches!(&f.body[1], Stmt::Match { .. }));
     }
 
     #[test]
