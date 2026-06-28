@@ -340,6 +340,38 @@ fn main() -> int:
 }
 
 #[test]
+fn generics_monomorphize_and_run() {
+    // A generic function is instantiated once per distinct set of type args:
+    // `first` is used at `int`, `str`, and `[int]` (binding `T = [int]` from a
+    // nested array), `combine` at `int` and `str`. All run under -O3, so the
+    // monomorphized clones and their ARC bookkeeping must stay balanced.
+    let src = r#"fn first[T](xs: [T]) -> T:
+    return xs[0]
+
+fn identity[T](x: T) -> T:
+    return x
+
+fn combine[T](a: T, b: T) -> T:
+    return a + b
+
+fn main() -> int:
+    let nums = [10, 20, 30]
+    print(first(nums))
+    let words = ["alpha", "beta"]
+    print(first(words))
+    print(identity(42))
+    print(combine(3, 4))
+    print(combine("ab", "cd"))
+    let grid = [[1, 2], [3, 4]]
+    print(first(first(grid)))
+    return 0
+"#;
+    let (stdout, code) = compile_and_run("e2e_generics", src, &["--release"]);
+    assert_eq!(stdout, "10\nalpha\n42\n7\nabcd\n1\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
 fn out_of_bounds_index_traps() {
     let src = "fn main() -> int:\n    let xs = [1, 2]\n    print(xs[5])\n    return 0\n";
     let (stdout, code) = compile_and_run("e2e_oob", src, &[]);

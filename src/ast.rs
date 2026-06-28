@@ -16,6 +16,10 @@ pub enum ElemType {
     Struct(u32),
     /// Interned enum id — an index into `Program::enums`.
     Enum(u32),
+    /// A generic type parameter, by its index in the enclosing generic
+    /// function's `type_params`. Only appears inside generic templates;
+    /// monomorphization substitutes it away before codegen ever runs.
+    Param(u32),
 }
 
 impl ElemType {
@@ -27,6 +31,7 @@ impl ElemType {
             ElemType::Str => Type::Str,
             ElemType::Struct(id) => Type::Struct(id),
             ElemType::Enum(id) => Type::Enum(id),
+            ElemType::Param(id) => Type::Param(id),
         }
     }
 
@@ -39,6 +44,7 @@ impl ElemType {
             Type::Str => Some(ElemType::Str),
             Type::Struct(id) => Some(ElemType::Struct(id)),
             Type::Enum(id) => Some(ElemType::Enum(id)),
+            Type::Param(id) => Some(ElemType::Param(id)),
             Type::Array(..) | Type::Unit => None,
         }
     }
@@ -59,6 +65,10 @@ pub enum Type {
     /// A user-defined enum (tagged union), by interned id (index into
     /// `Program::enums`).
     Enum(u32),
+    /// A generic type parameter, by its index in the enclosing generic
+    /// function's `type_params`. Replaced with a concrete type by
+    /// monomorphization, so it never reaches ARC insertion or codegen.
+    Param(u32),
     /// The "no value" type of statements and functions without `-> T`.
     Unit,
 }
@@ -112,6 +122,7 @@ impl std::fmt::Display for Type {
             }
             Type::Struct(id) => write!(f, "struct#{id}"),
             Type::Enum(id) => write!(f, "enum#{id}"),
+            Type::Param(id) => write!(f, "T#{id}"),
             Type::Unit => write!(f, "unit"),
         }
     }
@@ -287,6 +298,11 @@ pub struct Param {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Function {
     pub name: String,
+    /// Generic type parameter names, e.g. `["T", "U"]` for `fn f[T, U](...)`.
+    /// Empty for a non-generic function. A function with type parameters is a
+    /// *template*: monomorphization stamps out a concrete copy per distinct set
+    /// of type arguments and drops the template before codegen.
+    pub type_params: Vec<String>,
     /// `Some` for a struct method `fn (p: Point) area():` — the explicit
     /// receiver, which is not part of `params`. Its type must be a struct.
     pub recv: Option<Param>,

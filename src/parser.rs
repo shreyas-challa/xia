@@ -52,6 +52,10 @@ pub struct Parser {
     /// Enum name -> interned id, collected by the same pre-scan so an enum
     /// type can be named before its declaration.
     enum_ids: HashMap<String, u32>,
+    /// Generic type parameter names in scope while parsing the current
+    /// function's signature and body; a bare type name matching one resolves
+    /// to `Type::Param(index)`. Empty outside a generic function.
+    type_params: Vec<String>,
 }
 
 type PResult<T> = Result<T, ParseError>;
@@ -73,7 +77,7 @@ impl Parser {
                 }
             }
         }
-        Parser { tokens, pos: 0, struct_ids, enum_ids }
+        Parser { tokens, pos: 0, struct_ids, enum_ids, type_params: Vec::new() }
     }
 
     fn peek(&self) -> &TokKind {
@@ -181,6 +185,10 @@ impl Parser {
             return Ok(arr);
         }
         let name = self.expect_ident()?;
+        // A generic type parameter in scope shadows everything else.
+        if let Some(idx) = self.type_params.iter().position(|p| p == &name) {
+            return Ok(Type::Param(idx as u32));
+        }
         match name.as_str() {
             "int" => Ok(Type::Int),
             "float" => Ok(Type::Float),
@@ -325,22 +333,57 @@ impl Parser {
             None
         };
         let name = self.expect_ident()?;
-        self.expect(TokKind::LParen)?;
-        let mut params = Vec::new();
-        while !self.check(&TokKind::RParen) {
-            let pname = self.expect_ident()?;
+        // Optional generic type parameters: `fn f[T, U](...)`. They go in scope
+        // for the rest of the signature and the body, then are cleared.
+        let type_params = self.parse_type_params()?;
+        if !type_params.is_empty() && recv.is_some() {
+            return Err(self.error("generic methods are not supported".into()));
+        }
+        self.type_params = type_params.clone();
+        let result = (|| {
+            self.expect(TokKind::LParen)?;
+            let mut params = Vec::new();
+            while !self.check(&TokKind::RParen) {
+                let pname = self.expect_ident()?;
+                self.expect(TokKind::Colon)?;
+                let ty = self.parse_type()?;
+                params.push(Param { name: pname, ty });
+                if !self.check(&TokKind::Comma) {
+                    self.expect(TokKind::RParen)?;
+                    break;
+                }
+            }
+            let ret = self.parse_return_type()?;
             self.expect(TokKind::Colon)?;
-            let ty = self.parse_type()?;
-            params.push(Param { name: pname, ty });
+            let body = self.parse_block()?;
+            Ok(Function { name, type_params, recv, params, ret, body, line })
+        })();
+        self.type_params = Vec::new();
+        result
+    }
+
+    /// Parse an optional `[T, U]` generic type-parameter clause after a
+    /// function name. Returns an empty vec when there is no `[`.
+    fn parse_type_params(&mut self) -> PResult<Vec<String>> {
+        if !self.check(&TokKind::LBracket) {
+            return Ok(Vec::new());
+        }
+        let mut names = Vec::new();
+        while !self.check(&TokKind::RBracket) {
+            let n = self.expect_ident()?;
+            if names.contains(&n) {
+                return Err(self.error(format!("duplicate type parameter `{n}`")));
+            }
+            names.push(n);
             if !self.check(&TokKind::Comma) {
-                self.expect(TokKind::RParen)?;
+                self.expect(TokKind::RBracket)?;
                 break;
             }
         }
-        let ret = self.parse_return_type()?;
-        self.expect(TokKind::Colon)?;
-        let body = self.parse_block()?;
-        Ok(Function { name, recv, params, ret, body, line })
+        if names.is_empty() {
+            return Err(self.error("empty `[]` type-parameter list".into()));
+        }
+        Ok(names)
     }
 
     // ----- statements ---------------------------------------------------

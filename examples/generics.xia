@@ -1,0 +1,39 @@
+# Generics: functions parameterized over a type, `fn name[T](...)`.
+#
+# A generic function is a *template*. The compiler does not codegen it
+# directly; instead, each call infers the type arguments from the argument
+# types and stamps out a concrete copy (monomorphization). By the time ARC
+# insertion and LLVM codegen run, every `T` has been replaced by a real type,
+# so generics cost nothing at runtime — each instantiation is an ordinary
+# function with a mangled name like `first$int`.
+
+# The element of an array, whatever the element type is.
+fn first[T](xs: [T]) -> T:
+    return xs[0]
+
+# Identity: returns its argument unchanged. `T` is inferred from the call.
+fn identity[T](x: T) -> T:
+    return x
+
+# Both arguments share the one type parameter, so they must agree; `+` works
+# for whatever concrete type is supplied (here `int` and `str`).
+fn combine[T](a: T, b: T) -> T:
+    return a + b
+
+# A type parameter can bind to an array type itself: calling `first` on a
+# `[[int]]` infers `T = [int]`, so the result is a row.
+fn main() -> int:
+    let nums = [10, 20, 30]
+    print(first(nums))          # 10
+
+    let words = ["alpha", "beta"]
+    print(first(words))         # alpha
+
+    print(identity(42))         # 42
+    print(combine(3, 4))        # 7
+    print(combine("ab", "cd"))  # abcd
+
+    let grid = [[1, 2], [3, 4]]
+    let row = first(grid)       # T = [int]
+    print(first(row))           # 1
+    return 0

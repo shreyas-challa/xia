@@ -103,6 +103,7 @@ impl<'ctx> CodeGen<'ctx> {
             Type::Array(..) => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Struct(_) => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Enum(_) => self.context.ptr_type(AddressSpace::default()).into(),
+            Type::Param(_) => unreachable!("generic type parameter survived monomorphization"),
             Type::Unit => unreachable!("unit has no basic type"),
         }
     }
@@ -955,6 +956,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .builder
                 .build_ptr_to_int(v.into_pointer_value(), i64_ty, "pword")
                 .map_err(err),
+            Type::Param(_) => unreachable!("generic type parameter survived monomorphization"),
             Type::Unit => Err("codegen: cannot store a unit value in an array".into()),
         }
     }
@@ -981,6 +983,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .build_int_to_ptr(w, self.ptr_ty(), "pval")
                 .map_err(err)?
                 .into()),
+            Type::Param(_) => unreachable!("generic type parameter survived monomorphization"),
             Type::Unit => Err("codegen: cannot load a unit value from an array".into()),
         }
     }
@@ -1615,6 +1618,7 @@ impl<'ctx> CodeGen<'ctx> {
             Type::Array(..) | Type::Struct(_) | Type::Enum(_) | Type::Unit => {
                 return Err("codegen: cannot print this type".into());
             }
+            Type::Param(_) => unreachable!("generic type parameter survived monomorphization"),
         };
         let fmt_ptr = self.str_literal(fmt)?;
         let printf = self.libc_printf();

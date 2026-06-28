@@ -7,7 +7,7 @@
 
 use crate::ast::*;
 use crate::diag::Span;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 #[derive(Debug, Clone)]
@@ -31,6 +31,9 @@ pub struct FnSig {
     pub params: Vec<Type>,
     pub varargs: bool,
     pub ret: Type,
+    /// Number of generic type parameters. `0` for an ordinary function; a
+    /// positive count marks a generic template whose calls are monomorphized.
+    pub type_params: usize,
 }
 
 /// A stack of lexical scopes mapping variable name -> type.
@@ -79,6 +82,15 @@ pub struct Analyzer {
     symbols: SymbolTable,
     current_ret: Type,
     loop_depth: usize,
+    /// Generic function templates, keyed by name, kept for monomorphization.
+    generic_fns: HashMap<String, Function>,
+    /// Pending monomorphization requests: (generic name, concrete type args).
+    mono_queue: Vec<(String, Vec<Type>)>,
+    /// Mangled names already emitted, so each instantiation is built once.
+    mono_done: HashSet<String>,
+    /// Concrete functions produced by monomorphization, appended to the
+    /// program once every request has been processed.
+    mono_fns: Vec<Function>,
 }
 
 const BUILTINS: &[&str] = &["print", "str", "len", "push", "pop", "find"];
@@ -96,6 +108,10 @@ impl Analyzer {
             symbols: SymbolTable::new(),
             current_ret: Type::Unit,
             loop_depth: 0,
+            generic_fns: HashMap::new(),
+            mono_queue: Vec::new(),
+            mono_done: HashSet::new(),
+            mono_fns: Vec::new(),
         }
     }
 
@@ -167,6 +183,7 @@ impl Analyzer {
                 params: e.params.clone(),
                 varargs: e.varargs,
                 ret: e.ret,
+                type_params: 0,
             };
             if self.functions.insert(e.name.clone(), sig).is_some() {
                 return Err(SemaError {
@@ -180,6 +197,7 @@ impl Analyzer {
                 params: f.params.iter().map(|p| p.ty).collect(),
                 varargs: false,
                 ret: f.ret,
+                type_params: f.type_params.len(),
             };
             if let Some(recv) = &f.recv {
                 // A method: keyed by (receiver struct, method name), separate
@@ -223,11 +241,38 @@ impl Analyzer {
                     message: format!("`{}` collides with an enum or variant of the same name", f.name),
                 });
             }
+            // A generic function is a template: keep a copy to monomorphize on
+            // demand. It is not checked or codegen'd directly.
+            if !f.type_params.is_empty() {
+                self.generic_fns.insert(f.name.clone(), f.clone());
+            }
         }
 
+        // Check every concrete function; generic templates are checked once per
+        // instantiation instead (driven by the calls discovered below).
         for f in &mut program.functions {
-            self.check_function(f)?;
+            if f.type_params.is_empty() {
+                self.check_function(f)?;
+            }
         }
+
+        // Drain the monomorphization worklist. Checking each concrete clone may
+        // discover further generic calls, which enqueue more work.
+        while let Some((name, args)) = self.mono_queue.pop() {
+            let mangled = self.mangle(&name, &args);
+            if !self.mono_done.insert(mangled.clone()) {
+                continue; // already generated (handles recursion + reuse)
+            }
+            let template = self.generic_fns[&name].clone();
+            let mut concrete = instantiate(template, &args, mangled);
+            self.check_function(&mut concrete)?;
+            self.mono_fns.push(concrete);
+        }
+
+        // Replace templates with their concrete instantiations so later passes
+        // (ARC, codegen) never see a `Type::Param`.
+        program.functions.retain(|f| f.type_params.is_empty());
+        program.functions.append(&mut self.mono_fns);
         Ok(())
     }
 
@@ -614,6 +659,136 @@ impl Analyzer {
         Ok(Some(Type::Enum(eid)))
     }
 
+    /// Type-check a call to a generic function: infer the type arguments from
+    /// the argument types, request the matching instantiation, rewrite the
+    /// callee `name` to its mangled symbol, and return the concrete result
+    /// type. `sig.params` may contain `Type::Param`s to solve for.
+    fn check_generic_call(
+        &mut self,
+        name: &mut String,
+        args: &mut [Expr],
+        span: Span,
+        sig: &FnSig,
+    ) -> SResult<Type> {
+        if args.len() != sig.params.len() {
+            return Err(SemaError {
+                span,
+                message: format!(
+                    "`{name}` expects {} argument(s), got {}",
+                    sig.params.len(),
+                    args.len()
+                ),
+            });
+        }
+        // Solve for each type parameter by matching parameter patterns against
+        // the concrete argument types.
+        let mut subst: Vec<Option<Type>> = vec![None; sig.type_params];
+        for (param, arg) in sig.params.iter().zip(args.iter_mut()) {
+            let at = self.check_expr(arg)?;
+            self.unify(*param, at, &mut subst).map_err(|msg| SemaError {
+                span: arg.span,
+                message: format!("in call to `{name}`: {msg}"),
+            })?;
+        }
+        // Every parameter must have been pinned down by the arguments.
+        let template = &self.generic_fns[name.as_str()];
+        let mut targs = Vec::with_capacity(subst.len());
+        for (i, bound) in subst.into_iter().enumerate() {
+            match bound {
+                Some(t) => targs.push(t),
+                None => {
+                    return Err(SemaError {
+                        span,
+                        message: format!(
+                            "cannot infer type parameter `{}` of `{name}` from the arguments",
+                            template.type_params[i]
+                        ),
+                    });
+                }
+            }
+        }
+        let ret = subst_type(sig.ret, &targs);
+        let mangled = self.mangle(name, &targs);
+        self.mono_queue.push((name.clone(), targs));
+        *name = mangled;
+        Ok(ret)
+    }
+
+    /// Match a parameter pattern type against a concrete argument type,
+    /// extending `subst` with any type-parameter bindings it implies.
+    fn unify(&self, param: Type, arg: Type, subst: &mut [Option<Type>]) -> Result<(), String> {
+        let bind = |subst: &mut [Option<Type>], i: usize, t: Type| -> Result<(), String> {
+            match subst[i] {
+                None => {
+                    subst[i] = Some(t);
+                    Ok(())
+                }
+                Some(prev) if prev == t => Ok(()),
+                Some(prev) => Err(format!(
+                    "type parameter is used as both {} and {}",
+                    self.type_name(prev),
+                    self.type_name(t)
+                )),
+            }
+        };
+        match param {
+            Type::Param(i) => bind(subst, i as usize, arg),
+            Type::Array(ElemType::Param(i), dims) => {
+                // `[T]` against `[[int]]` binds `T = [int]`: peel `dims` array
+                // levels off the argument to recover the element type.
+                let mut peeled = arg;
+                for _ in 0..dims {
+                    peeled = peeled.array_elem().ok_or_else(|| {
+                        format!(
+                            "expected an array of at least {dims} dimension(s), found {}",
+                            self.type_name(arg)
+                        )
+                    })?;
+                }
+                bind(subst, i as usize, peeled)
+            }
+            concrete => {
+                if concrete == arg {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "expected {}, found {}",
+                        self.type_name(concrete),
+                        self.type_name(arg)
+                    ))
+                }
+            }
+        }
+    }
+
+    /// The mangled symbol for a generic instantiation, e.g. `first$int` or
+    /// `pair$arr_str`. Type-arg manglings use only identifier-safe characters.
+    fn mangle(&self, name: &str, targs: &[Type]) -> String {
+        let parts: Vec<String> = targs.iter().map(|t| self.mangle_type(*t)).collect();
+        format!("{name}${}", parts.join("$"))
+    }
+
+    fn mangle_type(&self, t: Type) -> String {
+        match t {
+            Type::Int => "int".into(),
+            Type::Float => "float".into(),
+            Type::Bool => "bool".into(),
+            Type::Str => "str".into(),
+            Type::Unit => "unit".into(),
+            Type::Struct(id) => self.structs[id as usize].name.clone(),
+            Type::Enum(id) => self.enums[id as usize].name.clone(),
+            Type::Array(base, dims) => {
+                let mut s = String::new();
+                for _ in 0..dims {
+                    s.push_str("arr_");
+                }
+                s.push_str(&self.mangle_type(base.to_type()));
+                s
+            }
+            Type::Param(id) => format!("T{id}"),
+        }
+    }
+
     fn check_expr(&mut self, expr: &mut Expr) -> SResult<Type> {
         if let Some(ty) = self.try_enum_init(expr)? {
             expr.ty = Some(ty);
@@ -848,39 +1023,46 @@ impl Analyzer {
                             span,
                             message: format!("call to undefined function `{name}`"),
                         })?;
-                    if args.len() < sig.params.len()
-                        || (!sig.varargs && args.len() != sig.params.len())
-                    {
-                        return Err(SemaError {
-                            span,
-                            message: format!(
-                                "`{name}` expects {}{} argument(s), got {}",
-                                if sig.varargs { "at least " } else { "" },
-                                sig.params.len(),
-                                args.len()
-                            ),
-                        });
-                    }
-                    for (i, arg) in args.iter_mut().enumerate() {
-                        let at = self.check_expr(arg)?;
-                        if let Some(expected) = sig.params.get(i) {
-                            if at != *expected {
-                                return Err(SemaError {
-                                    span,
-                                    message: format!(
-                                        "argument {} of `{name}`: expected {expected}, found {at}",
-                                        i + 1
-                                    ),
-                                });
-                            }
-                        } else if at == Type::Unit {
+                    // A generic function: infer its type arguments from the
+                    // call, enqueue the instantiation, and rewrite the callee
+                    // name to the mangled concrete symbol.
+                    if sig.type_params > 0 {
+                        self.check_generic_call(name, args, span, &sig)?
+                    } else {
+                        if args.len() < sig.params.len()
+                            || (!sig.varargs && args.len() != sig.params.len())
+                        {
                             return Err(SemaError {
                                 span,
-                                message: "cannot pass a unit value as a vararg".into(),
+                                message: format!(
+                                    "`{name}` expects {}{} argument(s), got {}",
+                                    if sig.varargs { "at least " } else { "" },
+                                    sig.params.len(),
+                                    args.len()
+                                ),
                             });
                         }
+                        for (i, arg) in args.iter_mut().enumerate() {
+                            let at = self.check_expr(arg)?;
+                            if let Some(expected) = sig.params.get(i) {
+                                if at != *expected {
+                                    return Err(SemaError {
+                                        span,
+                                        message: format!(
+                                            "argument {} of `{name}`: expected {expected}, found {at}",
+                                            i + 1
+                                        ),
+                                    });
+                                }
+                            } else if at == Type::Unit {
+                                return Err(SemaError {
+                                    span,
+                                    message: "cannot pass a unit value as a vararg".into(),
+                                });
+                            }
+                        }
+                        sig.ret
                     }
-                    sig.ret
                 }
             }
             ExprKind::MethodCall(recv, method, args) => {
@@ -1007,6 +1189,67 @@ impl Analyzer {
         };
         expr.ty = Some(ty);
         Ok(ty)
+    }
+}
+
+/// Substitute concrete type arguments for the type parameters in a type.
+fn subst_type(t: Type, targs: &[Type]) -> Type {
+    match t {
+        Type::Param(i) => targs[i as usize],
+        Type::Array(ElemType::Param(i), dims) => {
+            // `[T]` with `T = [int]` becomes `[[int]]`: stack `dims` array
+            // levels over the substituted element type.
+            let mut r = targs[i as usize];
+            for _ in 0..dims {
+                r = Type::array_of(r).expect("array_of during substitution");
+            }
+            r
+        }
+        other => other,
+    }
+}
+
+/// Build a concrete function from a generic template by substituting `targs`
+/// for its type parameters in the signature and in body type annotations. The
+/// resulting body is re-checked from scratch, so expression types need not be
+/// substituted here.
+fn instantiate(mut f: Function, targs: &[Type], mangled: String) -> Function {
+    f.name = mangled;
+    f.type_params = Vec::new();
+    for p in &mut f.params {
+        p.ty = subst_type(p.ty, targs);
+    }
+    f.ret = subst_type(f.ret, targs);
+    subst_block(&mut f.body, targs);
+    f
+}
+
+/// Substitute type parameters in the explicit type annotations a body carries
+/// (`let x: T = ...`); other types are recomputed when the clone is checked.
+fn subst_block(block: &mut Block, targs: &[Type]) {
+    for stmt in block.iter_mut() {
+        match stmt {
+            Stmt::Let { ty, .. } => {
+                if let Some(t) = ty {
+                    *t = subst_type(*t, targs);
+                }
+            }
+            Stmt::If { then_block, else_block, .. } => {
+                subst_block(then_block, targs);
+                if let Some(b) = else_block {
+                    subst_block(b, targs);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::ForEach { body, .. } => subst_block(body, targs),
+            Stmt::Match { arms, .. } => {
+                for arm in arms.iter_mut() {
+                    subst_block(&mut arm.body, targs);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1436,6 +1679,70 @@ mod tests {
         assert!(
             analyze("struct print:\n    x: int\nfn main():\n    return\n").is_err(),
             "struct shadowing a builtin is rejected"
+        );
+    }
+
+    #[test]
+    fn generic_calls_monomorphize_per_type() {
+        // `identity` is called at int and str, so two concrete clones replace
+        // the template; the template itself is dropped before later passes.
+        let src = "fn identity[T](x: T) -> T:\n    return x\nfn main() -> int:\n    print(identity(1))\n    print(identity(\"hi\"))\n    return identity(0)\n";
+        let prog = analyze(src).unwrap();
+        // No `type_params` survive; the template is gone, two instantiations
+        // and `main` remain.
+        assert!(prog.functions.iter().all(|f| f.type_params.is_empty()));
+        let mut names: Vec<&str> = prog.functions.iter().map(|f| f.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["identity$int", "identity$str", "main"]);
+    }
+
+    #[test]
+    fn generic_call_rewrites_callee_to_mangled_symbol() {
+        // The call site's callee name is rewritten to the mangled instantiation
+        // so codegen targets the concrete clone.
+        let src = "fn first[T](xs: [T]) -> T:\n    return xs[0]\nfn main() -> int:\n    let xs = [1, 2]\n    return first(xs)\n";
+        let prog = analyze(src).unwrap();
+        let main = prog.functions.iter().find(|f| f.name == "main").unwrap();
+        let Stmt::Return { value: Some(e), .. } = &main.body[1] else {
+            panic!("expected return");
+        };
+        let ExprKind::Call(name, _) = &e.kind else { panic!("expected call") };
+        assert_eq!(name, "first$int");
+        assert_eq!(e.ty, Some(Type::Int));
+    }
+
+    #[test]
+    fn type_param_binds_to_array_for_nested_arg() {
+        // `first` on a `[[int]]` infers `T = [int]`, mangled as `arr_int`.
+        let src = "fn first[T](xs: [T]) -> T:\n    return xs[0]\nfn main() -> int:\n    let g = [[1, 2], [3, 4]]\n    let row = first(g)\n    return row[0]\n";
+        let prog = analyze(src).unwrap();
+        assert!(prog.functions.iter().any(|f| f.name == "first$arr_int"));
+    }
+
+    #[test]
+    fn generic_inference_failures_are_rejected() {
+        // The one type parameter is pinned to two different types.
+        assert!(
+            analyze("fn pair[T](a: T, b: T) -> T:\n    return a\nfn main() -> int:\n    return pair(1, 2)\nfn x():\n    pair(1, \"s\")\n").is_err(),
+            "T cannot be both int and str"
+        );
+        // Wrong number of arguments to a generic function.
+        assert!(
+            analyze("fn id[T](x: T) -> T:\n    return x\nfn main():\n    id(1, 2)\n").is_err(),
+            "id takes one argument"
+        );
+        // The argument is not an array, so `[T]` cannot be matched.
+        assert!(
+            analyze("fn first[T](xs: [T]) -> T:\n    return xs[0]\nfn main() -> int:\n    return first(5)\n").is_err(),
+            "first wants an array"
+        );
+    }
+
+    #[test]
+    fn duplicate_type_parameter_is_rejected() {
+        assert!(
+            parse("fn f[T, T](x: T) -> T:\n    return x\n").is_err(),
+            "duplicate type parameter T"
         );
     }
 }

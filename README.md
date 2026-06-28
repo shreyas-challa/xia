@@ -157,6 +157,14 @@ Linux/macOS it uses the system `cc`.
   within that arm), or is the catch-all `_`. A `match` must be exhaustive or
   end in a `_` arm; duplicate and unknown-variant arms are rejected. See
   `examples/enums.xia`.
+- Functions may be generic: `fn name[T, U](...)` introduces type parameters
+  usable anywhere a type is expected in the signature and body (`fn first[T]
+  (xs: [T]) -> T:`). A generic function is a template — each call infers its
+  type arguments from the argument types and the compiler stamps out a
+  concrete copy (monomorphization), so generics have no runtime cost and `T`
+  never reaches codegen. Type arguments must be inferable from the arguments;
+  a parameter shared by several arguments must agree across them. Methods may
+  not be generic. See `examples/generics.xia`.
 - `let x = expr` (inferred) or `let x: type = expr`; assignment with `=`.
   An empty array literal needs an annotation: `let xs: [int] = []`.
 - `if` / `elif` / `else`, `while`, `break`, `continue` — blocks by
