@@ -5,8 +5,9 @@ indentation-based syntax, automatic reference counting (ARC) instead of a
 garbage collector, and a zero-cost C FFI. The compiler is written in Rust and
 emits native machine code through LLVM 18.
 
+
 ```
-# Strings and arrays are heap-allocated and managed by ARC — no GC.
+# Strings and arrays are heap-allocated and managed by ARC (no GC)
 extern fn printf(fmt: str, ...) -> int
 
 fn greet(name: str) -> str:
